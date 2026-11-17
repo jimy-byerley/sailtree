@@ -1,0 +1,4 @@
+target/
+vendor/
+RPMS/
+*.rpm
