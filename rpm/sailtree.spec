@@ -7,6 +7,7 @@ URL:        https://github.com/jimy-byerley/sailtree
 Source0:    %{name}-%{version}.tar.bz2
 Requires:   sailfishsilica-qt5 >= 0.10.9
 Requires:   libsailfishapp
+Requires:   qt5-qtsvg-plugin-imageformat-svg
 BuildRequires:  rust >= 1.75
 BuildRequires:  cargo >= 1.75
 BuildRequires:  rust-std-static

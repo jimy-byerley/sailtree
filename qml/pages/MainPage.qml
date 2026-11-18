@@ -10,25 +10,38 @@ Page {
 
     // second line with permissions, owner, size and date under each item
     property bool showDetails: false
-    // which drop-down of the top bar is open: "", "menu" or "add"
+    // which drop-down of the top bar is open: "", "menu", "sort", or "add" for the single selected item
     property string openPanel: ""
 
     TreeModel {
         id: treeModel
         onFailed: Notices.show(message, Notice.Long, Notice.Bottom)
+        onOpenRequested: Qt.openUrlExternally(Logic.fileUrl(path))
         onRevealed: list.positionViewAtIndex(row, top ? ListView.Beginning : ListView.Contain)
-        onSelectionChanged: if (selectionCount > 0) page.openPanel = ""
+        // each drop-down belongs to one state of the top bar
+        onSelectionChanged: {
+            if (page.openPanel === "add" ? selectedRow < 0 : selectionCount > 0)
+                page.openPanel = ""
+        }
         // the local device is the starting point: show its home folder right away
         Component.onCompleted: toggle(0)
     }
 
-    function create(row, folder) {
+    // new folder or file where the single selected item is: in a folder, in the current folder
+    // of a device, next to a file
+    function create(folder) {
         page.openPanel = ""
+        if (treeModel.selectedRow < 0)
+            return
         var dialog = pageStack.push(Qt.resolvedUrl("NameDialog.qml"), {
             title: folder ? qsTr("New folder") : qsTr("New file"),
             acceptText: qsTr("Create")
         })
         dialog.accepted.connect(function() {
+            // the row may have moved while the dialog was open
+            var row = treeModel.selectedRow
+            if (row < 0)
+                return
             if (folder)
                 treeModel.createFolder(row, dialog.name)
             else
@@ -79,10 +92,10 @@ Page {
             width: parent.width
             height: Theme.itemSizeLarge
 
-            // without selection: display options and creation
+            // without selection: display options
             Item {
                 anchors.fill: parent
-                visible: treeModel.selectionCount === 0
+                visible: treeModel.selectionCount === 0 && treeModel.pendingCount === 0
 
                 IconButton {
                     id: menuButton
@@ -95,7 +108,7 @@ Page {
                 Label {
                     anchors {
                         left: menuButton.right
-                        right: addButton.left
+                        right: sortButton.left
                         verticalCenter: parent.verticalCenter
                     }
                     horizontalAlignment: Text.AlignHCenter
@@ -105,27 +118,68 @@ Page {
                     text: "Sailtree"
                 }
 
-                IconButton {
-                    id: addButton
+                ActionButton {
+                    id: sortButton
                     anchors { right: parent.right; rightMargin: Theme.paddingMedium; verticalCenter: parent.verticalCenter }
-                    icon.source: "image://theme/icon-m-add"
-                    highlighted: down || page.openPanel === "add"
-                    onClicked: page.openPanel = page.openPanel === "add" ? "" : "add"
+                    name: "sort"
+                    highlighted: down || page.openPanel === "sort"
+                    onClicked: page.openPanel = page.openPanel === "sort" ? "" : "sort"
+                }
+            }
+
+            // items kept aside for a copy or move: waiting for the destination, chosen with the
+            // button of a device or folder row
+            Item {
+                anchors.fill: parent
+                visible: treeModel.pendingCount > 0
+
+                IconButton {
+                    id: cancelButton
+                    anchors { left: parent.left; leftMargin: Theme.paddingMedium; verticalCenter: parent.verticalCenter }
+                    icon.source: "image://theme/icon-m-clear"
+                    onClicked: treeModel.cancelTransfer()
+                }
+                Label {
+                    anchors {
+                        left: cancelButton.right
+                        leftMargin: Theme.paddingMedium
+                        right: parent.right
+                        rightMargin: Theme.horizontalPageMargin
+                        verticalCenter: parent.verticalCenter
+                    }
+                    truncationMode: TruncationMode.Fade
+                    color: Theme.highlightColor
+                    text: treeModel.pendingMove ? qsTr("Move %n item(s) to…", "", treeModel.pendingCount)
+                                                : qsTr("Copy %n item(s) to…", "", treeModel.pendingCount)
                 }
             }
 
             // with a selection: actions on it
             SelectionActions {
                 anchors.fill: parent
-                visible: treeModel.selectionCount > 0
+                visible: treeModel.selectionCount > 0 && treeModel.pendingCount === 0
+                onCopyRequested: treeModel.startTransfer(false)
+                onMoveRequested: treeModel.startTransfer(true)
                 count: treeModel.selectionCount
-                single: treeModel.selectedRow >= 0
+                itemCount: treeModel.selectedItemCount
+                kind: treeModel.selectedKind
+                addOpen: page.openPanel === "add"
                 onClearRequested: treeModel.clearSelection()
+                onEnterRequested: treeModel.enter(treeModel.selectedRow)
+                onAddRequested: page.openPanel = page.openPanel === "add" ? "" : "add"
                 onRenameRequested: page.renameSelected()
                 onPermissionsRequested: page.changePermissions()
-                onDeleteRequested: remorse.execute(qsTr("Deleting %n item(s)", "", treeModel.selectionCount),
+                onDeleteRequested: remorse.execute(qsTr("Deleting %n item(s)", "", treeModel.selectedItemCount),
                                                    function() { treeModel.removeSelected() })
             }
+        }
+
+        // a copy or move is running
+        ProgressBar {
+            width: parent.width
+            visible: treeModel.busy
+            indeterminate: true
+            label: qsTr("Transferring…")
         }
 
         // drop-down of the menu button
@@ -148,26 +202,53 @@ Page {
             }
         }
 
-        // drop-down of the add button
+        // drop-down of the sort button
+        Column {
+            width: parent.width
+            visible: page.openPanel === "sort"
+
+            Repeater {
+                model: [
+                    { label: qsTr("Sort by name"), key: "name" },
+                    { label: qsTr("Sort by date, newest first"), key: "date" },
+                    { label: qsTr("Sort by size, biggest first"), key: "size" }
+                ]
+
+                BackgroundItem {
+                    id: sortEntry
+                    width: parent.width
+                    height: Theme.itemSizeSmall
+                    readonly property bool current: treeModel.sort === modelData.key
+                    onClicked: {
+                        treeModel.sort = modelData.key
+                        page.openPanel = ""
+                    }
+
+                    Label {
+                        anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin; verticalCenter: parent.verticalCenter }
+                        text: modelData.label
+                        color: sortEntry.highlighted || sortEntry.current ? Theme.highlightColor : Theme.primaryColor
+                    }
+                }
+            }
+        }
+
+        // drop-down of the add button of the selection actions
         Column {
             width: parent.width
             visible: page.openPanel === "add"
 
             Repeater {
                 model: [
-                    { label: qsTr("Device"), icon: "image://theme/icon-m-computer", action: "" },
                     { label: qsTr("Folder"), icon: "image://theme/icon-m-file-folder", action: "folder" },
                     { label: qsTr("File"), icon: "image://theme/icon-m-file-document-" + (Theme.colorScheme === Theme.LightOnDark ? "dark" : "light"), action: "file" }
                 ]
 
                 BackgroundItem {
+                    id: addEntry
                     width: parent.width
                     height: Theme.itemSizeSmall
-                    // adding devices comes with remote devices
-                    enabled: modelData.action !== ""
-                    opacity: enabled ? 1 : Theme.opacityLow
-                    // -1: in the home folder
-                    onClicked: page.create(-1, modelData.action === "folder")
+                    onClicked: page.create(modelData.action === "folder")
 
                     Icon {
                         id: entryIcon
@@ -176,12 +257,12 @@ Page {
                         height: width
                         sourceSize.width: width
                         source: modelData.icon
-                        highlighted: parent.highlighted
+                        highlighted: addEntry.highlighted
                     }
                     Label {
                         anchors { left: entryIcon.right; leftMargin: Theme.paddingMedium; verticalCenter: parent.verticalCenter }
                         text: modelData.label
-                        color: parent.highlighted ? Theme.highlightColor : Theme.primaryColor
+                        color: addEntry.highlighted ? Theme.highlightColor : Theme.primaryColor
                     }
                 }
             }
@@ -194,6 +275,14 @@ Page {
         clip: true
         model: treeModel
 
+        PullDownMenu {
+            MenuItem {
+                text: qsTr("Add device")
+                // comes with remote devices
+                enabled: false
+            }
+        }
+
         section.property: "category"
         section.delegate: SectionHeader {
             text: Logic.title(section)
@@ -203,8 +292,8 @@ Page {
             width: list.width
             tree: treeModel
             showDetails: page.showDetails
-            onNewFolderRequested: page.create(model.index, true)
-            onNewFileRequested: page.create(model.index, false)
+            picking: treeModel.pendingCount > 0
+            onPicked: treeModel.transferTo(model.index)
         }
 
         VerticalScrollDecorator { }

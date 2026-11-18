@@ -40,6 +40,10 @@ impl Selection {
         changed
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &Item> {
+        self.items.iter()
+    }
+
     /// the selected item when there is exactly one
     pub fn single(&self) -> Option<&Item> {
         if self.items.len() == 1 {
@@ -130,6 +134,7 @@ mod tests {
         assert!(selection.contains(1, Path::new("/home/a")));
         assert!(!selection.contains(1, Path::new("/etc/b")));
         assert_eq!(selection.single(), None);
+        assert_eq!(selection.iter().filter(|(device, _)| *device == 0).count(), 2);
     }
 
     #[test]

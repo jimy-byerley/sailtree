@@ -43,12 +43,13 @@ TestCase {
 
     function test_details() {
         var date = new Date(2026, 10, 18, 20, 25).getTime()
-        compare(Logic.details("rw-r--r--", "user", "user", 1500, date, false, ""),
-                "rw-r--r--  user  1.5 kB  2026-11-18 20:25")
-        compare(Logic.details("rwxr-xr-x", "root", "wheel", 4096, date, true, ""),
+        compare(Logic.details("rw-r--r--", "user", "user", date, "", 1500),
+                "rw-r--r--  user  2026-11-18 20:25  1.5 kB")
+        // a folder whose content is not counted yet
+        compare(Logic.details("rwxr-xr-x", "root", "wheel", date, "", -1),
                 "rwxr-xr-x  root:wheel  2026-11-18 20:25")
-        compare(Logic.details("rwxrwxrwx", "user", "user", 12, date, false, "../target"),
-                "rwxrwxrwx  user  12 B  2026-11-18 20:25  → ../target")
+        compare(Logic.details("rwxrwxrwx", "user", "user", date, "../target", 0),
+                "rwxrwxrwx  user  2026-11-18 20:25  → ../target  0 B")
     }
 
     function test_validName() {
@@ -100,6 +101,24 @@ TestCase {
         compare(Logic.fileUrl("/home/user/notes.txt"), "file:///home/user/notes.txt")
         compare(Logic.fileUrl("/home/user/my file #1?.txt"), "file:///home/user/my%20file%20%231%3F.txt")
         compare(Logic.fileUrl("/"), "file:///")
+    }
+
+    function test_crumbs() {
+        var crumbs = Logic.crumbs("/home/user/My Documents")
+        compare(crumbs.length, 4)
+        compare(crumbs[0].name, "/")
+        compare(crumbs[0].path, "/")
+        compare(crumbs[1].name, "home")
+        compare(crumbs[1].path, "/home")
+        compare(crumbs[3].name, "My Documents")
+        compare(crumbs[3].path, "/home/user/My Documents")
+
+        compare(Logic.crumbs("/").length, 1)
+        compare(Logic.crumbs("").length, 1)
+        // doubled and trailing separators do not make levels
+        crumbs = Logic.crumbs("/srv//files/")
+        compare(crumbs.length, 3)
+        compare(crumbs[2].path, "/srv/files")
     }
 
     function test_title() {

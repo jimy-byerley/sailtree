@@ -38,7 +38,19 @@ main page is a list of devices in 3 categories
 
 clicking a device expand/collapses. same for a folder under it
 
-# connection settings
+file items show
+- icon (varying by file type)
+- file name with extension
+- details (permissions, user, date, size)
+- ring for ratio of size in current folder (only on local device)
+
+## connection settings
+
+- hostname
+- port
+- password
+- fingerprint (if any)
+- current folder
 
 ## sorting
 
@@ -53,28 +65,34 @@ clicking one online or not tries to connect to it, starting on remote user home 
 
 any item starts collapsed, and every expanded item immediate childs is cached in RAM is scrolling is smooth
 
+files in any folder can be sorted either by name (defautl), date, size
+
 ## item management
 
-devices, folders, files can be selected by clicking a small circle on the right of the screen. files can be selected from different folders and devices
+devices, folders, files can be 
+- selected by clicking a small circle on the right of the screen. 
+- expanded or opened by clicking their line
+- files can be selected from different folders and devices
 
-devices, folders, files can be expanded or opened by clicking their line
+a device item has a current folder shown by a path
+- clicking a level in this path sets current folder to the clicked level
+- tree under this device starts from this current folder
 
-screen top bar:
-
-- a menu button to 
+screen top bar has a menu button to 
   - enable the display of details (owner, permissions, date) for items
   - show hidden files
-- a button '+' with a drop-down for adding device, folder, file
+  - sort by name, date, size
 
-when there is a selection, the above buttons are replaced by actions on selection
-
+when there is a selection, the top bar content is replaced by actions on selection
+- set as device current folder
+- new file, folder
 - move, copy, rename, delete ...
 
 long press on a device opens connection settings
 
 ## adding 
 
-- remote devices can be added manually with '+/device'
+- adding a device is a button show by dragging the full page down
 - periodic ARP scanning reveals detected hosts, shown by name if there is a DNS on the network, automatically adding them to the online category
 
 when connecting on a new or existing device, login is asked and a checkbox propose to save it to avoid prompting again

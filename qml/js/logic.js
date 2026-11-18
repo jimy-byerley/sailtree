@@ -34,14 +34,14 @@ function formatDate(milliseconds) {
             + " " + pad(date.getHours()) + ":" + pad(date.getMinutes())
 }
 
-// second line of a row when details are shown
-function details(permissions, owner, group, size, date, isFolder, link) {
-    var parts = [permissions, owner === group ? owner : owner + ":" + group]
-    if (!isFolder)
-        parts.push(formatSize(size))
-    parts.push(formatDate(date))
+// second line of a row when details are shown. the size comes last, and is left out while
+// it is not known (negative)
+function details(permissions, owner, group, date, link, size) {
+    var parts = [permissions, owner === group ? owner : owner + ":" + group, formatDate(date)]
     if (link)
         parts.push("→ " + link)
+    if (size >= 0)
+        parts.push(formatSize(size))
     return parts.join("  ")
 }
 
@@ -68,6 +68,21 @@ function withPermission(mode, who, what, allowed) {
 // url opening a local file with the application the system associates to it
 function fileUrl(path) {
     return "file://" + path.split("/").map(encodeURIComponent).join("/")
+}
+
+// levels of the current folder of a device, from the root down: each has the name to show
+// and the path it stands for
+function crumbs(path) {
+    var result = [{ name: "/", path: "/" }]
+    var at = ""
+    var parts = path.split("/")
+    for (var i = 0; i < parts.length; i++) {
+        if (parts[i].length > 0) {
+            at += "/" + parts[i]
+            result.push({ name: parts[i], path: at })
+        }
+    }
+    return result
 }
 
 // capitalized category name for section headers

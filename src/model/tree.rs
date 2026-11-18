@@ -1,6 +1,6 @@
 //! the list model shown by the main page: devices, with their folders and files below them
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
@@ -9,14 +9,16 @@ use qmetaobject::{
     QObject, QPointer, QString, QVariant, USER_ROLE,
 };
 
-use super::node::{next_towards, Row, RowKind, Step, Tree};
+use super::node::{Row, RowKind, Sort, Step, Tree};
 use super::selection::Selection;
-use crate::devices::{Device, DeviceId};
+use crate::devices::{Device, DeviceId, DeviceKind};
 use crate::fs::{mode_to_string, Entry, Fs, FsError};
+use crate::opener;
 use crate::runtime;
+use crate::staging;
 
 /// data exposed for each row, in the order of their Qt role numbers
-const ROLES: [&str; 16] = [
+const ROLES: [&str; 17] = [
     "name",
     "depth",
     "kind",
@@ -33,6 +35,7 @@ const ROLES: [&str; 16] = [
     "permissions",
     "mode",
     "link",
+    "ratio",
 ];
 
 /// a role value, before its conversion for Qt
@@ -60,10 +63,12 @@ struct State {
     tree: Tree,
     devices: Vec<Device>,
     selection: Selection,
-    /// folder to expand down to, on the first expansion of a device
-    reveal: Option<(DeviceId, PathBuf)>,
-    /// devices that already had their first expansion
-    opened: HashSet<DeviceId>,
+    /// items waiting for the destination of their copy or move
+    pending: Option<Pending>,
+    /// number of copies and moves being done
+    transfers: usize,
+    /// home folder of the user, where files are made visible to the applications opening them
+    home: PathBuf,
     /// run filesystem operations before returning instead of in the background (unit tests)
     inline: bool,
 }
@@ -78,7 +83,7 @@ impl State {
     fn new(devices: Vec<Device>) -> Self {
         let mut tree = Tree::default();
         for device in &devices {
-            for step in tree.plan_add_device(device.id, &device.name, &device.root) {
+            for step in tree.plan_add_device(device.id, &device.name, &device.home) {
                 tree.apply(step);
             }
         }
@@ -86,14 +91,65 @@ impl State {
             tree,
             devices,
             selection: Selection::default(),
-            reveal: None,
-            opened: HashSet::new(),
+            pending: None,
+            transfers: 0,
+            home: Device::local().home,
             inline: false,
         }
     }
 
     fn device(&self, id: DeviceId) -> Option<&Device> {
         self.devices.iter().find(|device| device.id == id)
+    }
+
+    /// row of a selection item, if it is displayed
+    fn shown(&self, device: DeviceId, path: &Path) -> Option<usize> {
+        if path == device_item() {
+            self.tree.find_device(device)
+        } else {
+            // the current folder of a device is its device row, not an item of its own
+            self.tree.find(device, path).filter(|&row| self.tree.rows()[row].is_item())
+        }
+    }
+
+    /// forget the selected items that are not displayed. returns whether the selection changed
+    fn prune_selection(&mut self) -> bool {
+        let mut selection = std::mem::take(&mut self.selection);
+        let changed = selection.retain(|device, path| self.shown(device, path).is_some());
+        self.selection = selection;
+        changed
+    }
+}
+
+struct Pending {
+    moving: bool,
+    items: Vec<(DeviceId, PathBuf)>,
+}
+
+/// path standing for a device itself in the selection: its current folder changes
+fn device_item() -> &'static Path {
+    Path::new("")
+}
+
+/// how a row is identified in the selection
+fn selection_path(row: &Row) -> &Path {
+    match row.kind {
+        RowKind::Device => device_item(),
+        _ => &row.path,
+    }
+}
+
+fn selectable(row: &Row) -> bool {
+    row.is_item() || row.kind == RowKind::Device
+}
+
+fn kind_name(kind: RowKind) -> &'static str {
+    match kind {
+        RowKind::Device => "device",
+        RowKind::Folder => "folder",
+        RowKind::File => "file",
+        RowKind::Loading => "loading",
+        RowKind::Error => "error",
     }
 }
 
@@ -107,25 +163,47 @@ pub struct TreeModel {
     showHidden: qt_property!(bool; READ show_hidden WRITE set_show_hidden NOTIFY showHiddenChanged),
     showHiddenChanged: qt_signal!(),
 
+    /// what orders the items of a folder: "name", "date" or "size"
+    #[allow(dead_code)] // storage unused, the value lives in the tree
+    sort: qt_property!(QString; READ sort_name WRITE set_sort_name NOTIFY sortChanged),
+    sortChanged: qt_signal!(),
+
     /// number of selected items
     selectionCount: qt_property!(i32; READ selection_count NOTIFY selectionChanged),
+    /// number of selected files and folders, the items that can be deleted
+    selectedItemCount: qt_property!(i32; READ selected_item_count NOTIFY selectionChanged),
     /// row of the selected item when there is exactly one, -1 otherwise
     selectedRow: qt_property!(i32; READ selected_row NOTIFY selectionChanged),
+    /// "device", "folder" or "file" when exactly one item is selected, empty otherwise
+    selectedKind: qt_property!(QString; READ selected_kind NOTIFY selectionChanged),
     selectionChanged: qt_signal!(),
+
+    /// number of items waiting for the destination of their copy or move
+    pendingCount: qt_property!(i32; READ pending_count NOTIFY pendingChanged),
+    /// whether the waiting items will be moved rather than copied
+    pendingMove: qt_property!(bool; READ pending_move NOTIFY pendingChanged),
+    pendingChanged: qt_signal!(),
+    /// whether a copy or move is being done
+    busy: qt_property!(bool; READ busy NOTIFY busyChanged),
+    busyChanged: qt_signal!(),
 
     /// an operation failed, with a message for the user
     failed: qt_signal!(message: QString),
+    /// this local path should be opened with the application the system associates to it
+    openRequested: qt_signal!(path: QString),
     /// this row should be brought into view, at the top of the view if `top`
     revealed: qt_signal!(row: i32, top: bool),
 
     /// expand or collapse a device or folder
     toggle: qt_method!(fn(&mut self, row: i32)),
+    /// open the file at `row` with another application: answers with `openRequested`
+    open: qt_method!(fn(&mut self, row: i32)),
     /// list an expanded device or folder again
     refresh: qt_method!(fn(&mut self, row: i32)),
     /// rename a file or folder inside its folder
     rename: qt_method!(fn(&mut self, row: i32, name: QString)),
-    /// create a folder in the device or folder at `row`, or next to the file at `row`.
-    /// a negative row means the home folder of the first device
+    /// create a folder in the folder at `row`, in the current folder of the device at `row`,
+    /// or next to the file at `row`
     createFolder: qt_method!(fn(&mut self, row: i32, name: QString)),
     /// create an empty file, same destination rules as `createFolder`
     createFile: qt_method!(fn(&mut self, row: i32, name: QString)),
@@ -135,10 +213,21 @@ pub struct TreeModel {
     nameAt: qt_method!(fn(&self, row: i32) -> QString),
     /// permission bits of the item at `row`
     modeAt: qt_method!(fn(&self, row: i32) -> i32),
-    /// select or unselect a file or folder
+    /// make the folder at `row` the current folder of its device
+    enter: qt_method!(fn(&mut self, row: i32)),
+    /// set the current folder of the device `row` belongs to
+    setCurrentFolder: qt_method!(fn(&mut self, row: i32, path: QString)),
+    /// keep the selected files and folders aside to copy or move them, and clear the selection
+    startTransfer: qt_method!(fn(&mut self, moving: bool)),
+    /// forget the items kept aside
+    cancelTransfer: qt_method!(fn(&mut self)),
+    /// copy or move the items kept aside into the folder at `row`, or into the current folder
+    /// of the device at `row`
+    transferTo: qt_method!(fn(&mut self, row: i32)),
+    /// select or unselect a device, file or folder
     toggleSelected: qt_method!(fn(&mut self, row: i32)),
     clearSelection: qt_method!(fn(&mut self)),
-    /// delete the selected items, folders with their content
+    /// delete the selected files and folders, folders with their content
     removeSelected: qt_method!(fn(&mut self)),
 
     state: State,
@@ -169,23 +258,22 @@ impl QAbstractListModel for TreeModel {
 impl TreeModel {
     /// value of a role for a row, `None` for an unknown row or role
     pub fn value(&self, row: i32, role: &str) -> Option<Value> {
+        let index = usize::try_from(row).ok()?;
         let row = self.row(row)?;
+        // the size ring is only for the local device
+        let local = self.state.device(row.device).is_some_and(|device| device.kind == DeviceKind::Local);
         let entry = row.entry.as_ref();
         let text = |text: &str| Value::Text(text.to_owned());
         Some(match role {
             "name" => text(&row.name),
             "depth" => Value::Int(row.depth as i32),
-            "kind" => text(match row.kind {
-                RowKind::Device => "device",
-                RowKind::Folder => "folder",
-                RowKind::File => "file",
-                RowKind::Loading => "loading",
-                RowKind::Error => "error",
-            }),
+            "kind" => text(kind_name(row.kind)),
             "expanded" => Value::Bool(row.expanded),
             "hasChildren" => Value::Bool(row.expandable()),
-            "selectable" => Value::Bool(row.is_item()),
-            "selected" => Value::Bool(row.is_item() && self.state.selection.contains(row.device, &row.path)),
+            "selectable" => Value::Bool(selectable(row)),
+            "selected" => Value::Bool(
+                selectable(row) && self.state.selection.contains(row.device, selection_path(row)),
+            ),
             "category" => text(
                 self.state.device(row.device).map_or("", |device| device.state.category()),
             ),
@@ -202,6 +290,8 @@ impl TreeModel {
                     .and_then(|entry| entry.link_target.as_ref())
                     .map_or(String::new(), |target| target.to_string_lossy().into_owned()),
             ),
+            // share of the files of its folder, negative when it has none
+            "ratio" => Value::Number(self.state.tree.ratio(index).filter(|_| local).unwrap_or(-1.0)),
             _ => return None,
         })
     }
@@ -267,12 +357,31 @@ impl TreeModel {
         self.failed(QString::from(error.to_string()));
     }
 
+    /// one message for the failures of a grouped action
+    fn report_all(&mut self, errors: &[String]) {
+        if let Some(first) = errors.first() {
+            let message = match errors.len() {
+                1 => first.clone(),
+                count => format!("{first} (and {} more)", count - 1),
+            };
+            self.report(message);
+        }
+    }
+
+    /// the files of a folder changed: the ratio of each of them depends on the others
+    fn measure(&mut self, device: DeviceId, folder: &Path) {
+        if let Some(row) = self.state.tree.find(device, folder) {
+            let last = row + self.state.tree.descendants(row);
+            self.rows_changed(row, last);
+        }
+    }
+
     fn toggle(&mut self, row: i32) {
         let Some(current) = self.row(row) else { return };
         if !current.expandable() {
             return;
         }
-        let (device, path, kind) = (current.device, current.path.clone(), current.kind);
+        let (device, path) = (current.device, current.path.clone());
         if current.expanded {
             let steps = self.state.tree.plan_collapse(row as usize);
             self.run(steps);
@@ -281,11 +390,6 @@ impl TreeModel {
                 self.selectionChanged();
             }
             return;
-        }
-        if kind == RowKind::Device && self.state.opened.insert(device) {
-            if let Some(home) = self.state.device(device).map(|device| device.home.clone()) {
-                self.state.reveal = Some((device, home));
-            }
         }
         self.expand(row as usize);
     }
@@ -299,6 +403,31 @@ impl TreeModel {
         }
         self.run(steps);
         self.list(device, path);
+    }
+
+    fn open(&mut self, row: i32) {
+        let Some(current) = self.row(row) else { return };
+        if current.kind != RowKind::File {
+            return;
+        }
+        let path = current.path.clone();
+        let empty = current.entry.as_ref().is_some_and(|entry| entry.size == 0);
+        let home = self.state.home.clone();
+        self.spawn(
+            async move {
+                // the system has no application for a file without content
+                let work = move || match empty {
+                    true => opener::open_empty(&home, &path).map(|()| None),
+                    false => Ok(Some(staging::stage(&home, &path))),
+                };
+                tokio::task::spawn_blocking(work).await.unwrap_or_else(|error| Err(error.to_string()))
+            },
+            |this, result| match result {
+                Ok(Some(path)) => this.openRequested(QString::from(path.to_string_lossy().as_ref())),
+                Ok(None) => {}
+                Err(message) => this.report(message),
+            },
+        );
     }
 
     fn refresh(&mut self, row: i32) {
@@ -324,29 +453,37 @@ impl TreeModel {
         }
         self.run(steps);
         // a full listing replaces the rows of the folder: selected items may be gone
-        let tree = &self.state.tree;
-        if self.state.selection.retain(|device, path| tree.find(device, path).is_some()) {
+        if self.state.prune_selection() {
             self.selectionChanged();
         }
-        self.continue_reveal(device, path);
     }
 
-    /// after the listing of `path`: expand the next folder towards the one to reveal
-    fn continue_reveal(&mut self, device: DeviceId, path: &Path) {
-        let Some((reveal_device, target)) = self.state.reveal.clone() else { return };
-        if reveal_device != device || !target.starts_with(path) {
-            return;
+    fn enter(&mut self, row: i32) {
+        let Some(current) = self.row(row) else { return };
+        if current.kind == RowKind::Folder {
+            self.set_current(current.device, current.path.clone());
         }
-        let next = next_towards(path, &target).and_then(|next| self.state.tree.find(device, &next));
-        match next {
-            Some(row) if self.state.tree.rows()[row].expandable() => self.expand(row),
-            // arrived, or the way is not visible: show how far we went
-            _ => {
-                self.state.reveal = None;
-                if let Some(row) = self.state.tree.find(device, path) {
-                    self.revealed(row as i32, true);
-                }
-            }
+    }
+
+    #[allow(non_snake_case)]
+    fn setCurrentFolder(&mut self, row: i32, path: QString) {
+        let Some(current) = self.row(row) else { return };
+        let path = PathBuf::from(path.to_string());
+        if path.is_absolute() {
+            self.set_current(current.device, path);
+        }
+    }
+
+    /// restart the tree of a device from another folder, and show its content
+    fn set_current(&mut self, device: DeviceId, path: PathBuf) {
+        let steps = self.state.tree.plan_set_current(device, &path);
+        self.run(steps);
+        // the previous rows are gone, the device itself may stay selected
+        self.state.prune_selection();
+        self.selectionChanged();
+        if let Some(row) = self.state.tree.find_device(device) {
+            self.expand(row);
+            self.revealed(row as i32, true);
         }
     }
 
@@ -393,10 +530,6 @@ impl TreeModel {
 
     /// folder in which something created "at" this row goes
     fn destination(&self, row: i32) -> Option<(DeviceId, PathBuf)> {
-        if row < 0 {
-            let device = self.state.devices.first()?;
-            return Some((device.id, device.home.clone()));
-        }
         let current = self.row(row)?;
         match current.kind {
             RowKind::Device | RowKind::Folder => Some((current.device, current.path.clone())),
@@ -423,12 +556,99 @@ impl TreeModel {
             move |this, result| match result {
                 Ok((path, entry)) => {
                     this.upsert(device, &path, entry);
-                    // make the new item visible when its folder was collapsed
-                    if let Some(row) = this.state.tree.find(device, &parent) {
-                        this.expand(row);
-                    }
+                    this.arrived(device, &parent);
                 }
                 Err(error) => this.report(error),
+            },
+        );
+    }
+
+    /// after items were added to a folder: show its content
+    fn arrived(&mut self, device: DeviceId, folder: &Path) {
+        match self.state.tree.find(device, folder) {
+            // the listing of a collapsed folder brings the new items
+            Some(row) if !self.state.tree.rows()[row].expanded => self.expand(row),
+            _ => self.measure(device, folder),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn startTransfer(&mut self, moving: bool) {
+        let items: Vec<_> =
+            self.state.selection.top_level().into_iter().filter(|(_, path)| path != device_item()).collect();
+        if items.is_empty() {
+            return;
+        }
+        self.state.pending = Some(Pending { moving, items });
+        self.pendingChanged();
+        self.clearSelection();
+    }
+
+    #[allow(non_snake_case)]
+    fn cancelTransfer(&mut self) {
+        if self.state.pending.take().is_some() {
+            self.pendingChanged();
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn transferTo(&mut self, row: i32) {
+        let Some((device, folder)) = self.destination(row) else { return };
+        let Some(Pending { moving, items }) = self.state.pending.take() else { return };
+        self.pendingChanged();
+        if items.iter().any(|(source, _)| *source != device) {
+            self.report("transfers between devices are not supported yet");
+            return;
+        }
+        let Some(fs) = self.fs(device) else { return };
+        let into = folder.clone();
+        self.state.transfers += 1;
+        self.busyChanged();
+        self.spawn(
+            async move {
+                let mut results = Vec::with_capacity(items.len());
+                for (_, source) in items {
+                    let result = async {
+                        let arrived = match moving {
+                            true => fs.move_into(&source, &into).await?,
+                            false => fs.copy_into(&source, &into).await?,
+                        };
+                        let entry = fs.stat(&arrived).await?;
+                        Ok::<_, FsError>((arrived, entry))
+                    }
+                    .await;
+                    results.push((source, result));
+                }
+                results
+            },
+            move |this, results| {
+                this.state.transfers -= 1;
+                this.busyChanged();
+                let count = results.len();
+                let mut errors = Vec::new();
+                let mut left = Vec::new();
+                for (source, result) in results {
+                    match result {
+                        Ok((arrived, entry)) => {
+                            if moving {
+                                let steps = this.state.tree.plan_remove(device, &source);
+                                this.run(steps);
+                                left.extend(source.parent().map(Path::to_owned));
+                            }
+                            this.upsert(device, &arrived, entry);
+                        }
+                        Err(error) => errors.push(error.to_string()),
+                    }
+                }
+                if errors.len() < count {
+                    this.arrived(device, &folder);
+                }
+                left.sort();
+                left.dedup();
+                for parent in left {
+                    this.measure(device, &parent);
+                }
+                this.report_all(&errors);
             },
         );
     }
@@ -476,10 +696,10 @@ impl TreeModel {
     #[allow(non_snake_case)]
     fn toggleSelected(&mut self, row: i32) {
         let Some(current) = self.row(row) else { return };
-        if !current.is_item() {
+        if !selectable(current) {
             return;
         }
-        let (device, path) = (current.device, current.path.clone());
+        let (device, path) = (current.device, selection_path(current).to_owned());
         self.state.selection.toggle(device, &path);
         self.rows_changed(row as usize, row as usize);
         self.selectionChanged();
@@ -507,6 +727,8 @@ impl TreeModel {
             .selection
             .top_level()
             .into_iter()
+            // devices are not deleted
+            .filter(|(_, path)| path != device_item())
             .filter_map(|(device, path)| Some((device, path, self.fs(device)?)))
             .collect();
         if items.is_empty() {
@@ -523,6 +745,7 @@ impl TreeModel {
             },
             |this, results| {
                 let mut errors = Vec::new();
+                let mut left = Vec::new();
                 for (device, path, result) in results {
                     match result {
                         // already gone is as good as deleted
@@ -530,18 +753,18 @@ impl TreeModel {
                             let steps = this.state.tree.plan_remove(device, &path);
                             this.run(steps);
                             this.state.selection.removed(device, &path);
+                            left.extend(path.parent().map(|parent| (device, parent.to_owned())));
                         }
                         Err(error) => errors.push(error.to_string()),
                     }
                 }
                 this.selectionChanged();
-                if let Some(first) = errors.first() {
-                    let message = match errors.len() {
-                        1 => first.clone(),
-                        count => format!("{first} (and {} more)", count - 1),
-                    };
-                    this.report(message);
+                left.sort();
+                left.dedup();
+                for (device, parent) in left {
+                    this.measure(device, &parent);
                 }
+                this.report_all(&errors);
             },
         );
     }
@@ -556,8 +779,7 @@ impl TreeModel {
         }
         self.begin_reset_model();
         self.state.tree.set_show_hidden(show);
-        let tree = &self.state.tree;
-        let unselected = self.state.selection.retain(|device, path| tree.find(device, path).is_some());
+        let unselected = self.state.prune_selection();
         self.end_reset_model();
         self.showHiddenChanged();
         if unselected {
@@ -569,12 +791,59 @@ impl TreeModel {
         self.state.selection.count() as i32
     }
 
+    fn sort_name(&self) -> QString {
+        QString::from(match self.state.tree.sort() {
+            Sort::Name => "name",
+            Sort::Date => "date",
+            Sort::Size => "size",
+        })
+    }
+
+    fn set_sort_name(&mut self, name: QString) {
+        let sort = match name.to_string().as_str() {
+            "name" => Sort::Name,
+            "date" => Sort::Date,
+            "size" => Sort::Size,
+            _ => return,
+        };
+        if sort == self.state.tree.sort() {
+            return;
+        }
+        self.begin_reset_model();
+        self.state.tree.set_sort(sort);
+        self.end_reset_model();
+        self.sortChanged();
+        // the selected row may have moved
+        self.selectionChanged();
+    }
+
+    fn pending_count(&self) -> i32 {
+        self.state.pending.as_ref().map_or(0, |pending| pending.items.len() as i32)
+    }
+
+    fn pending_move(&self) -> bool {
+        self.state.pending.as_ref().is_some_and(|pending| pending.moving)
+    }
+
+    fn busy(&self) -> bool {
+        self.state.transfers > 0
+    }
+
+    fn selected_item_count(&self) -> i32 {
+        self.state.selection.iter().filter(|(_, path)| path != device_item()).count() as i32
+    }
+
     fn selected_row(&self) -> i32 {
         self.state
             .selection
             .single()
-            .and_then(|(device, path)| self.state.tree.find(*device, path))
+            .and_then(|(device, path)| self.state.shown(*device, path))
             .map_or(-1, |row| row as i32)
+    }
+
+    fn selected_kind(&self) -> QString {
+        let kind = usize::try_from(self.selected_row()).ok().and_then(|row| self.state.tree.row(row));
+        QString::from(kind.map_or("", |row| kind_name(row.kind)))
     }
 }
 
@@ -588,6 +857,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// temp/ { home/user/ { docs/ { report.txt }, .config/, notes.txt }, etc/ { hosts } }
+    /// with temp as current folder of the device
     fn sample() -> (TempDir, TreeModel) {
         let dir = TempDir::new();
         let root = dir.path();
@@ -604,11 +874,11 @@ mod tests {
             kind: DeviceKind::Local,
             state: DeviceState::Connected,
             fs: Fs::Local(Local),
-            root: root.to_owned(),
-            home: root.join("home/user"),
+            home: root.to_owned(),
         };
         let mut model = TreeModel::default();
         model.state = State::new(vec![device]);
+        model.state.home = root.join("home/user");
         model.state.inline = true;
         (dir, model)
     }
@@ -637,6 +907,21 @@ mod tests {
             .collect()
     }
 
+    /// expand the device, then down to home/user
+    fn open(model: &mut TreeModel) {
+        open_user(model);
+        assert_eq!(
+            names(model),
+            ["phone", "  etc", "  home", "    user", "      docs", "      notes.txt"]
+        );
+    }
+
+    fn open_user(model: &mut TreeModel) {
+        model.toggle(0);
+        model.toggle(row_of(model, "home"));
+        model.toggle(row_of(model, "user"));
+    }
+
     fn row_of(model: &TreeModel, name: &str) -> i32 {
         (0..model.row_count())
             .find(|&row| text(model, row, "name") == name)
@@ -649,10 +934,11 @@ mod tests {
         assert_eq!(model.row_count(), 1);
         assert_eq!(text(&model, 0, "kind"), "device");
         assert_eq!(text(&model, 0, "category"), "connected");
-        assert_eq!(text(&model, 0, "path"), "/");
+        // its tree starts from the home folder
+        assert_eq!(text(&model, 0, "path"), Device::local().home.to_str().unwrap());
         assert_eq!(model.value(0, "expanded"), Some(Value::Bool(false)));
         assert_eq!(model.value(0, "hasChildren"), Some(Value::Bool(true)));
-        assert_eq!(model.value(0, "selectable"), Some(Value::Bool(false)));
+        assert_eq!(model.value(0, "selectable"), Some(Value::Bool(true)));
     }
 
     #[test]
@@ -675,22 +961,130 @@ mod tests {
     }
 
     #[test]
-    fn first_expansion_of_a_device_goes_down_to_home() {
-        let (_dir, mut model) = sample();
-        model.toggle(0);
-        assert_eq!(
-            names(&model),
-            ["phone", "  etc", "  home", "    user", "      docs", "      notes.txt"]
-        );
-        assert_eq!(model.value(3, "expanded"), Some(Value::Bool(true)));
-        assert_eq!(model.value(1, "expanded"), Some(Value::Bool(false)));
-        assert_eq!(text(&model, 4, "category"), "connected");
-
-        // only the first time
-        model.toggle(0);
-        assert_eq!(names(&model), ["phone"]);
+    fn device_tree_starts_from_its_current_folder() {
+        let (dir, mut model) = sample();
+        let root = dir.path().to_str().unwrap().to_owned();
+        assert_eq!(text(&model, 0, "path"), root);
         model.toggle(0);
         assert_eq!(names(&model), ["phone", "  etc", "  home"]);
+        assert_eq!(text(&model, 1, "category"), "connected");
+        model.toggle(0);
+        assert_eq!(names(&model), ["phone"]);
+    }
+
+    #[test]
+    fn entering_a_folder_makes_it_the_current_folder() {
+        let (dir, mut model) = sample();
+        let root = dir.path().to_str().unwrap().to_owned();
+        open(&mut model);
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.toggleSelected(0);
+        // only folders can be entered
+        model.enter(row_of(&model, "notes.txt"));
+        model.enter(0);
+        model.enter(99);
+        assert_eq!(text(&model, 0, "path"), root);
+
+        model.enter(row_of(&model, "user"));
+        assert_eq!(names(&model), ["phone", "  docs", "  notes.txt"]);
+        assert_eq!(text(&model, 0, "path"), format!("{root}/home/user"));
+        assert_eq!(text(&model, 2, "path"), format!("{root}/home/user/notes.txt"));
+        // the rows were replaced: only the device is still selected
+        assert_eq!(model.selection_count(), 1);
+        assert_eq!(model.selected_row(), 0);
+        assert_eq!(model.value(2, "selected"), Some(Value::Bool(false)));
+
+        // back up through the path, from any row of the device
+        model.setCurrentFolder(1, root.as_str().into());
+        assert_eq!(names(&model), ["phone", "  etc", "  home"]);
+        assert_eq!(text(&model, 0, "path"), root);
+
+        // refused: not a full path, unknown row
+        model.setCurrentFolder(0, "home".into());
+        model.setCurrentFolder(99, "/".into());
+        assert_eq!(text(&model, 0, "path"), root);
+    }
+
+    #[test]
+    fn changing_the_current_folder_expands_the_device() {
+        let (dir, mut model) = sample();
+        model.setCurrentFolder(0, dir.path().join("etc").to_str().unwrap().into());
+        assert_eq!(names(&model), ["phone", "  hosts"]);
+        // a folder that cannot be listed shows why
+        model.setCurrentFolder(0, dir.path().join("missing").to_str().unwrap().into());
+        assert_eq!(names(&model), ["phone", "  <error>"]);
+    }
+
+    #[test]
+    fn device_selection() {
+        let (dir, mut model) = sample();
+        open(&mut model);
+        model.toggleSelected(0);
+        assert_eq!(model.value(0, "selected"), Some(Value::Bool(true)));
+        assert_eq!(model.selection_count(), 1);
+        assert_eq!(model.selected_item_count(), 0);
+        assert_eq!(model.selected_row(), 0);
+        assert_eq!(model.selected_kind().to_string(), "device");
+
+        // file actions do not apply to a device
+        model.removeSelected();
+        model.rename(0, "other".into());
+        model.chmod(0, 0o700);
+        assert!(dir.path().join("home/user/notes.txt").exists());
+        assert_eq!(names(&model).len(), 6);
+
+        // it stays selected when collapsed, and is not deleted with the rest
+        model.toggleSelected(row_of(&model, "etc"));
+        assert_eq!(model.selection_count(), 2);
+        assert_eq!(model.selected_item_count(), 1);
+        assert_eq!(model.selected_kind().to_string(), "");
+        model.removeSelected();
+        assert!(!dir.path().join("etc").exists());
+        assert!(dir.path().exists());
+        model.toggle(0);
+        assert_eq!(model.selection_count(), 1);
+        assert_eq!(model.selected_kind().to_string(), "device");
+    }
+
+    #[test]
+    fn kind_of_the_single_selected_item() {
+        let (_dir, mut model) = sample();
+        open(&mut model);
+        assert_eq!(model.selected_kind().to_string(), "");
+        model.toggleSelected(row_of(&model, "docs"));
+        assert_eq!(model.selected_kind().to_string(), "folder");
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        assert_eq!(model.selected_kind().to_string(), "");
+        model.toggleSelected(row_of(&model, "docs"));
+        assert_eq!(model.selected_kind().to_string(), "file");
+        assert_eq!(model.selected_item_count(), 1);
+    }
+
+    #[test]
+    fn sort_follows_the_property() {
+        let (dir, mut model) = sample();
+        fs::write(dir.path().join("home/user/big.txt"), [0u8; 100]).unwrap();
+        fs::write(dir.path().join("home/user/a.txt"), b"1").unwrap();
+        open_user(&mut model);
+        assert_eq!(model.sort_name().to_string(), "name");
+        assert_eq!(names(&model)[4..], ["      docs", "      a.txt", "      big.txt", "      notes.txt"]);
+
+        model.toggleSelected(row_of(&model, "a.txt"));
+        model.set_sort_name("size".into());
+        assert_eq!(model.sort_name().to_string(), "size");
+        assert_eq!(names(&model)[4..], ["      docs", "      big.txt", "      notes.txt", "      a.txt"]);
+        assert_eq!(model.selected_row(), row_of(&model, "a.txt"));
+
+        // created items take their place in the current order
+        model.createFile(row_of(&model, "user"), "empty".into());
+        assert_eq!(names(&model)[7..], ["      a.txt", "      empty"]);
+
+        model.set_sort_name("date".into());
+        assert_eq!(model.sort_name().to_string(), "date");
+        model.set_sort_name("colour".into());
+        assert_eq!(model.sort_name().to_string(), "date");
+        model.set_sort_name("name".into());
+        assert_eq!(names(&model)[5..], ["      a.txt", "      big.txt", "      empty", "      notes.txt"]);
     }
 
     #[test]
@@ -698,7 +1092,7 @@ mod tests {
         let (dir, mut model) = sample();
         fs::set_permissions(dir.path().join("home/user/notes.txt"), fs::Permissions::from_mode(0o640)).unwrap();
         std::os::unix::fs::symlink("notes.txt", dir.path().join("home/user/shortcut")).unwrap();
-        model.toggle(0);
+        open_user(&mut model);
 
         let notes = row_of(&model, "notes.txt");
         assert_eq!(text(&model, notes, "kind"), "file");
@@ -725,7 +1119,7 @@ mod tests {
     #[test]
     fn toggle_expands_and_collapses_folders() {
         let (_dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         model.toggle(row_of(&model, "docs"));
         model.toggle(row_of(&model, "etc"));
         assert_eq!(
@@ -769,7 +1163,7 @@ mod tests {
     #[test]
     fn refresh_shows_outside_changes() {
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         fs::write(dir.path().join("home/user/added.txt"), b"").unwrap();
         fs::remove_file(dir.path().join("home/user/notes.txt")).unwrap();
         model.refresh(row_of(&model, "user"));
@@ -782,7 +1176,7 @@ mod tests {
     #[test]
     fn hidden_items_follow_the_property() {
         let (_dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         assert!(!model.show_hidden());
         assert!(!names(&model).contains(&"      .config".to_owned()));
 
@@ -802,7 +1196,7 @@ mod tests {
     #[test]
     fn selection_across_folders() {
         let (_dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         model.toggle(row_of(&model, "etc"));
         assert_eq!(model.selection_count(), 0);
         assert_eq!(model.selected_row(), -1);
@@ -817,9 +1211,9 @@ mod tests {
         assert_eq!(model.selection_count(), 2);
         assert_eq!(model.selected_row(), -1);
 
-        // devices and out of range rows are not selectable
-        model.toggleSelected(0);
+        // placeholders and out of range rows are not selectable
         model.toggleSelected(99);
+        model.toggleSelected(-1);
         assert_eq!(model.selection_count(), 2);
 
         model.toggleSelected(notes);
@@ -831,7 +1225,7 @@ mod tests {
     #[test]
     fn collapsing_unselects_what_gets_hidden() {
         let (_dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         model.toggleSelected(row_of(&model, "notes.txt"));
         model.toggleSelected(row_of(&model, "user"));
         model.toggle(row_of(&model, "user"));
@@ -842,7 +1236,7 @@ mod tests {
     #[test]
     fn rename_moves_the_row_and_keeps_it_selected() {
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         let notes = row_of(&model, "notes.txt");
         model.toggleSelected(notes);
         model.rename(notes, "Archive.txt".into());
@@ -857,7 +1251,7 @@ mod tests {
     #[test]
     fn rename_of_a_folder() {
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         model.toggle(row_of(&model, "docs"));
         model.rename(row_of(&model, "docs"), "papers".into());
         // the renamed folder comes back collapsed
@@ -868,7 +1262,7 @@ mod tests {
     #[test]
     fn rename_failure_is_reported_and_changes_nothing() {
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         let before = names(&model);
         model.rename(row_of(&model, "notes.txt"), "docs".into());
         model.rename(row_of(&model, "notes.txt"), "a/b".into());
@@ -880,7 +1274,7 @@ mod tests {
     #[test]
     fn create_folder_and_file_in_a_folder() {
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         let user = row_of(&model, "user");
         model.createFolder(user, "music".into());
         model.createFile(user, "a.txt".into());
@@ -893,23 +1287,24 @@ mod tests {
     }
 
     #[test]
-    fn create_next_to_a_file_or_in_home() {
+    fn create_next_to_a_file_or_in_the_current_folder() {
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         model.createFile(row_of(&model, "notes.txt"), "sibling".into());
         assert!(dir.path().join("home/user/sibling").is_file());
-        model.createFolder(-1, "from-top-bar".into());
-        assert!(dir.path().join("home/user/from-top-bar").is_dir());
-        assert_eq!(
-            names(&model)[4..],
-            ["      docs", "      from-top-bar", "      notes.txt", "      sibling"]
-        );
+        assert_eq!(names(&model)[4..], ["      docs", "      notes.txt", "      sibling"]);
+        // on a device: in its current folder
+        model.createFolder(0, "from-device".into());
+        assert!(dir.path().join("from-device").is_dir());
+        assert_eq!(names(&model)[..4], ["phone", "  etc", "  from-device", "  home"]);
+        model.createFolder(-1, "nowhere".into());
+        assert_eq!(names(&model).len(), 8);
     }
 
     #[test]
     fn create_in_a_collapsed_folder_expands_it() {
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         model.createFile(row_of(&model, "etc"), "fstab".into());
         assert!(dir.path().join("etc/fstab").is_file());
         assert_eq!(names(&model)[1..4], ["  etc", "    fstab", "    hosts"]);
@@ -918,7 +1313,7 @@ mod tests {
     #[test]
     fn create_failure_changes_nothing() {
         let (_dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         let before = names(&model);
         model.createFolder(row_of(&model, "user"), "docs".into());
         model.createFile(row_of(&model, "user"), "".into());
@@ -928,7 +1323,7 @@ mod tests {
     #[test]
     fn chmod_updates_the_row() {
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         let notes = row_of(&model, "notes.txt");
         model.chmod(notes, 0o600);
         assert_eq!(text(&model, notes, "permissions"), "rw-------");
@@ -946,7 +1341,7 @@ mod tests {
     #[test]
     fn remove_selected_items() {
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         model.toggle(row_of(&model, "etc"));
         model.toggle(row_of(&model, "docs"));
         model.toggleSelected(row_of(&model, "hosts"));
@@ -970,7 +1365,7 @@ mod tests {
             return;
         }
         let (dir, mut model) = sample();
-        model.toggle(0);
+        open(&mut model);
         model.toggle(row_of(&model, "etc"));
         model.toggleSelected(row_of(&model, "hosts"));
         model.toggleSelected(row_of(&model, "notes.txt"));
@@ -988,7 +1383,7 @@ mod tests {
     fn name_and_mode_of_a_row() {
         let (dir, mut model) = sample();
         fs::set_permissions(dir.path().join("home/user/notes.txt"), fs::Permissions::from_mode(0o604)).unwrap();
-        model.toggle(0);
+        open(&mut model);
         let notes = row_of(&model, "notes.txt");
         assert_eq!(model.nameAt(notes).to_string(), "notes.txt");
         assert_eq!(model.modeAt(notes), 0o604);
@@ -996,6 +1391,164 @@ mod tests {
         assert_eq!(model.modeAt(0), 0);
         assert_eq!(model.nameAt(99).to_string(), "");
         assert_eq!(model.modeAt(-1), 0);
+    }
+
+    #[test]
+    fn opening_a_file_outside_the_shared_folders_links_it() {
+        let (dir, mut model) = sample();
+        let links = dir.path().join("home/user/Downloads/.sailtree-open");
+        open(&mut model);
+        // folders and devices are not opened
+        model.open(row_of(&model, "docs"));
+        model.open(0);
+        model.open(99);
+        assert!(!links.exists());
+
+        model.open(row_of(&model, "notes.txt"));
+        let staged: Vec<_> = fs::read_dir(&links).unwrap().map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(fs::read(staged[0].join("notes.txt")).unwrap(), b"12345");
+    }
+
+    fn number(model: &TreeModel, row: i32, role: &str) -> f64 {
+        match model.value(row, role) {
+            Some(Value::Number(number)) => number,
+            other => panic!("role {role} of row {row} is {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_an_empty_file_does_not_go_through_the_system_default() {
+        let (dir, mut model) = sample();
+        fs::write(dir.path().join("home/user/empty.txt"), b"").unwrap();
+        fs::write(dir.path().join("home/user/empty.log"), b"").unwrap();
+        open_user(&mut model);
+        // no launcher in the test environment: the failure is reported, the files were still
+        // made visible, under a name the text viewer accepts
+        model.open(row_of(&model, "empty.txt"));
+        model.open(row_of(&model, "empty.log"));
+        let links = dir.path().join("home/user/Downloads/.sailtree-open");
+        let mut staged: Vec<_> = fs::read_dir(links)
+            .unwrap()
+            .flat_map(|folder| fs::read_dir(folder.unwrap().path()).unwrap())
+            .map(|link| link.unwrap().file_name().into_string().unwrap())
+            .collect();
+        staged.sort();
+        assert_eq!(staged, ["empty.log.txt", "empty.txt"]);
+    }
+
+    #[test]
+    fn ratio_of_files_in_their_folder() {
+        let (dir, mut model) = sample();
+        fs::write(dir.path().join("home/user/big.bin"), [0u8; 15]).unwrap();
+        open_user(&mut model);
+        // notes.txt holds 5 bytes of the 20 in files directly in its folder
+        assert_eq!(number(&model, row_of(&model, "notes.txt"), "ratio"), 0.25);
+        assert_eq!(number(&model, row_of(&model, "big.bin"), "ratio"), 0.75);
+        // folders and devices have none
+        assert_eq!(number(&model, row_of(&model, "docs"), "ratio"), -1.0);
+        assert_eq!(number(&model, 0, "ratio"), -1.0);
+
+        model.toggleSelected(row_of(&model, "big.bin"));
+        model.removeSelected();
+        assert_eq!(number(&model, row_of(&model, "notes.txt"), "ratio"), 1.0);
+    }
+
+    #[test]
+    fn copy_of_the_selection_into_a_folder() {
+        let (dir, mut model) = sample();
+        open(&mut model);
+        assert_eq!(model.pending_count(), 0);
+        // nothing selected, or only a device: nothing to transfer
+        model.startTransfer(false);
+        model.toggleSelected(0);
+        model.startTransfer(false);
+        assert_eq!(model.pending_count(), 0);
+        model.clearSelection();
+
+        model.toggleSelected(row_of(&model, "docs"));
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.startTransfer(false);
+        assert_eq!(model.pending_count(), 2);
+        assert!(!model.pending_move());
+        assert_eq!(model.selection_count(), 0);
+
+        // the items wait while the tree changes
+        model.toggle(row_of(&model, "user"));
+        model.transferTo(row_of(&model, "etc"));
+        assert_eq!(model.pending_count(), 0);
+        assert!(!model.busy());
+        let root = dir.path();
+        assert_eq!(fs::read(root.join("etc/notes.txt")).unwrap(), b"12345");
+        assert_eq!(fs::read(root.join("etc/docs/report.txt")).unwrap(), b"report");
+        assert!(root.join("home/user/notes.txt").exists());
+        // the destination is expanded to show them
+        assert_eq!(
+            names(&model),
+            ["phone", "  etc", "    docs", "    hosts", "    notes.txt", "  home", "    user"]
+        );
+        assert_eq!(number(&model, row_of(&model, "notes.txt"), "ratio"), 1.0);
+    }
+
+    #[test]
+    fn move_of_the_selection_into_the_current_folder() {
+        let (dir, mut model) = sample();
+        open(&mut model);
+        model.toggle(row_of(&model, "docs"));
+        model.toggleSelected(row_of(&model, "report.txt"));
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.startTransfer(true);
+        assert!(model.pending_move());
+
+        // on a device: into its current folder
+        model.transferTo(0);
+        let root = dir.path();
+        assert!(root.join("report.txt").is_file());
+        assert!(root.join("notes.txt").is_file());
+        assert!(!root.join("home/user/notes.txt").exists());
+        assert!(!root.join("home/user/docs/report.txt").exists());
+        assert_eq!(
+            names(&model),
+            ["phone", "  etc", "  home", "    user", "      docs", "  notes.txt", "  report.txt"]
+        );
+        assert_eq!(number(&model, row_of(&model, "report.txt"), "ratio"), 6.0 / 11.0);
+        assert_eq!(model.pending_count(), 0);
+    }
+
+    #[test]
+    fn transfer_failures_keep_the_items_in_place() {
+        let (dir, mut model) = sample();
+        open(&mut model);
+        let before = names(&model);
+        // into the folder it is already in, and a folder into itself
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.startTransfer(true);
+        model.transferTo(row_of(&model, "user"));
+        model.toggleSelected(row_of(&model, "user"));
+        model.startTransfer(false);
+        model.transferTo(row_of(&model, "docs"));
+        assert_eq!(names(&model), before);
+        assert!(dir.path().join("home/user/notes.txt").exists());
+        assert!(!dir.path().join("home/user/docs/user").exists());
+    }
+
+    #[test]
+    fn transfer_can_be_cancelled() {
+        let (dir, mut model) = sample();
+        open(&mut model);
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.startTransfer(true);
+        model.cancelTransfer();
+        assert_eq!(model.pending_count(), 0);
+        model.transferTo(row_of(&model, "etc"));
+        model.cancelTransfer();
+        assert!(dir.path().join("home/user/notes.txt").exists());
+        assert!(!dir.path().join("etc/notes.txt").exists());
+        // an unknown destination keeps the items waiting
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.startTransfer(true);
+        model.transferTo(99);
+        assert_eq!(model.pending_count(), 1);
     }
 
     #[test]

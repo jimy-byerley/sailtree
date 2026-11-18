@@ -11,3 +11,7 @@
 # workflow
 
 the user is making the commits and pushing, claude doesn't unless being asked to
+
+# safety
+
+avoid anything that can break the real phone

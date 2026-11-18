@@ -43,9 +43,7 @@ pub struct Device {
     pub kind: DeviceKind,
     pub state: State,
     pub fs: Fs,
-    /// top folder shown under the device
-    pub root: PathBuf,
-    /// folder the exploration starts from, inside `root`
+    /// current folder of the device when the app starts
     pub home: PathBuf,
 }
 
@@ -58,7 +56,6 @@ impl Device {
             name: hostname().unwrap_or_else(|| "This device".to_owned()),
             kind: DeviceKind::Local,
             state: State::Connected,
-            root: PathBuf::from("/"),
             home: fs.home(),
             fs,
         }
@@ -93,8 +90,7 @@ mod tests {
         assert_eq!(device.state.category(), "connected");
         assert!(matches!(device.fs, Fs::Local(_)));
         assert!(!device.name.is_empty());
-        assert_eq!(device.root, PathBuf::from("/"));
-        assert!(device.home.starts_with(&device.root));
+        assert!(device.home.is_absolute());
     }
 
     #[test]

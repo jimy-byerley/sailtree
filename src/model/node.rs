@@ -24,7 +24,8 @@ pub enum RowKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub device: DeviceId,
-    /// path of the item on its device. placeholders have the path of the folder they stand in
+    /// path of the item on its device. a device has the path of its current folder,
+    /// placeholders the path of the folder they stand in
     pub path: PathBuf,
     /// 0 for devices, parent depth + 1 otherwise
     pub depth: u32,
@@ -38,11 +39,19 @@ pub struct Row {
     stash: Vec<Entry>,
 }
 
+/// what an item weighs in its folder: files have their size, the content of folders is not counted
+fn weight(entry: &Entry) -> u64 {
+    match entry.kind {
+        Kind::File => entry.size,
+        Kind::Folder => 0,
+    }
+}
+
 impl Row {
-    pub fn device(device: DeviceId, name: &str, root: &Path) -> Self {
+    pub fn device(device: DeviceId, name: &str, current: &Path) -> Self {
         Row {
             device,
-            path: root.to_owned(),
+            path: current.to_owned(),
             depth: 0,
             kind: RowKind::Device,
             name: name.to_owned(),
@@ -104,25 +113,63 @@ pub enum Step {
     Update { row: usize, new: Row },
 }
 
-/// display order inside a folder: folders first, then by name ignoring case
-pub fn order(a: &Entry, b: &Entry) -> Ordering {
+/// what orders the items of a folder
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Sort {
+    #[default]
+    Name,
+    /// most recently modified first
+    Date,
+    /// biggest files first. folders have no size of their own and stay ordered by name
+    Size,
+}
+
+/// display order inside a folder: folders first, then by the sort criterion,
+/// then by name ignoring case
+pub fn order(sort: Sort, a: &Entry, b: &Entry) -> Ordering {
+    let criterion = match sort {
+        Sort::Name => Ordering::Equal,
+        Sort::Date => b.mtime.cmp(&a.mtime),
+        Sort::Size if a.kind == Kind::Folder => Ordering::Equal,
+        Sort::Size => b.size.cmp(&a.size),
+    };
     (a.kind != Kind::Folder)
         .cmp(&(b.kind != Kind::Folder))
+        .then(criterion)
         .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         .then_with(|| a.name.cmp(&b.name))
 }
 
-/// the child of `from` to go through to reach `target`, `None` if `target` is not inside `from`
-pub fn next_towards(from: &Path, target: &Path) -> Option<PathBuf> {
-    let rest = target.strip_prefix(from).ok()?;
-    let next = rest.components().next()?;
-    Some(from.join(next))
+/// a run of sibling rows, each followed by its descendants, with every level put in order
+fn reordered(rows: &[Row], sort: Sort) -> Vec<Row> {
+    let Some(first) = rows.first() else { return Vec::new() };
+    let depth = first.depth;
+    let mut blocks: Vec<&[Row]> = Vec::new();
+    let mut start = 0;
+    for index in 1..=rows.len() {
+        if index == rows.len() || rows[index].depth == depth {
+            blocks.push(&rows[start..index]);
+            start = index;
+        }
+    }
+    // devices keep their order, placeholders are alone in their folder
+    blocks.sort_by(|a, b| match (&a[0].entry, &b[0].entry) {
+        (Some(a), Some(b)) => order(sort, a, b),
+        _ => Ordering::Equal,
+    });
+    let mut result = Vec::with_capacity(rows.len());
+    for block in blocks {
+        result.push(block[0].clone());
+        result.extend(reordered(&block[1..], sort));
+    }
+    result
 }
 
 #[derive(Debug, Default)]
 pub struct Tree {
     rows: Vec<Row>,
     show_hidden: bool,
+    sort: Sort,
 }
 
 impl Tree {
@@ -138,7 +185,17 @@ impl Tree {
         self.show_hidden
     }
 
-    /// index of the device, folder or file at this path, if it is visible
+    pub fn sort(&self) -> Sort {
+        self.sort
+    }
+
+    /// index of the row of a device
+    pub fn find_device(&self, device: DeviceId) -> Option<usize> {
+        self.rows.iter().position(|row| row.device == device && row.kind == RowKind::Device)
+    }
+
+    /// index of the folder or file at this path if it is visible,
+    /// or of the device having this path as current folder
     pub fn find(&self, device: DeviceId, path: &Path) -> Option<usize> {
         self.rows
             .iter()
@@ -161,7 +218,7 @@ impl Tree {
     fn child_position(&self, parent: usize, entry: &Entry) -> usize {
         self.children(parent)
             .find(|&index| match &self.rows[index].entry {
-                Some(other) => order(entry, other) == Ordering::Less,
+                Some(other) => order(self.sort, entry, other) == Ordering::Less,
                 None => false,
             })
             .unwrap_or(parent + 1 + self.descendants(parent))
@@ -179,9 +236,25 @@ impl Tree {
         }
     }
 
-    /// add a device after the existing ones
-    pub fn plan_add_device(&self, device: DeviceId, name: &str, root: &Path) -> Vec<Step> {
-        vec![Step::Insert { at: self.rows.len(), rows: vec![Row::device(device, name, root)] }]
+    /// add a device after the existing ones, with the folder its tree starts from
+    pub fn plan_add_device(&self, device: DeviceId, name: &str, current: &Path) -> Vec<Step> {
+        vec![Step::Insert { at: self.rows.len(), rows: vec![Row::device(device, name, current)] }]
+    }
+
+    /// change the folder the tree of a device starts from. the device ends collapsed
+    pub fn plan_set_current(&self, device: DeviceId, current: &Path) -> Vec<Step> {
+        let Some(row) = self.find_device(device) else { return Vec::new() };
+        let mut steps = Vec::new();
+        let count = self.descendants(row);
+        if count > 0 {
+            steps.push(Step::Remove { first: row + 1, count });
+        }
+        let mut new = self.rows[row].clone();
+        new.path = current.to_owned();
+        new.expanded = false;
+        new.stash.clear();
+        steps.push(Step::Update { row, new });
+        steps
     }
 
     /// mark a device or folder as expanded, with a placeholder until [Tree::plan_loaded]
@@ -221,7 +294,7 @@ impl Tree {
         let rows = match listing {
             Err(message) => vec![Row::placeholder(parent, RowKind::Error, &message)],
             Ok(mut entries) => {
-                entries.sort_by(order);
+                entries.sort_by(|a, b| order(self.sort, a, b));
                 let (hidden, shown): (Vec<Entry>, Vec<Entry>) =
                     entries.into_iter().partition(|entry| entry.hidden() && !self.show_hidden);
                 new.stash = hidden;
@@ -251,6 +324,20 @@ impl Tree {
         new.stash.clear();
         steps.push(Step::Update { row, new });
         steps
+    }
+
+    /// share of the files directly in its folder taken by a file, between 0 and 1.
+    /// hidden files are part of the folder even when they are not shown. folders have none:
+    /// their content is not counted
+    pub fn ratio(&self, row: usize) -> Option<f64> {
+        let entry = self.rows.get(row)?.entry.as_ref()?;
+        if entry.kind != Kind::File {
+            return None;
+        }
+        let parent = self.parent(row)?;
+        let shown = self.children(parent).filter_map(|index| self.rows[index].entry.as_ref());
+        let total: u64 = shown.chain(&self.rows[parent].stash).map(weight).sum();
+        Some(if total == 0 { 0.0 } else { entry.size as f64 / total as f64 })
     }
 
     /// forget a file or folder that does not exist anymore
@@ -317,6 +404,15 @@ impl Tree {
         (0..row).rev().find(|&index| self.rows[index].depth < depth)
     }
 
+    /// change the order of the items in all expanded folders.
+    /// this moves rows all over the list: views must be reset around it
+    pub fn set_sort(&mut self, sort: Sort) {
+        if sort != self.sort {
+            self.sort = sort;
+            self.rows = reordered(&self.rows, sort);
+        }
+    }
+
     /// show or hide the hidden items of all expanded folders.
     /// this changes rows all over the list: views must be reset around it
     pub fn set_show_hidden(&mut self, show: bool) {
@@ -335,9 +431,8 @@ impl Tree {
             } else if self.rows[index].entry.as_ref().is_some_and(Entry::hidden) {
                 let parent = self.parent(index).expect("files and folders have a parent");
                 let count = 1 + self.descendants(index);
-                let removed: Vec<Row> = self.rows.drain(index..index + count).collect();
-                let entry = removed.into_iter().next().and_then(|row| row.entry);
-                self.rows[parent].stash.extend(entry);
+                let removed = self.rows.drain(index..index + count).next().expect("at least the row");
+                self.rows[parent].stash.extend(removed.entry);
                 continue;
             }
             index += 1;
@@ -604,7 +699,7 @@ mod tests {
             file(".profile"),
             folder(".cache"),
         ];
-        entries.sort_by(order);
+        entries.sort_by(|a, b| order(Sort::Name, a, b));
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, [".cache", "alpha", "Zeta", ".profile", "A.txt", "a.txt", "b.txt"]);
     }
@@ -768,38 +863,162 @@ mod tests {
         assert_eq!(names[names.len() - 2..], ["1:.hidden", "1:readme"]);
     }
 
-    #[test]
-    fn path_towards_a_target() {
-        let home = Path::new("/home/user");
-        assert_eq!(next_towards(Path::new("/"), home), Some("/home".into()));
-        assert_eq!(next_towards(Path::new("/home"), home), Some("/home/user".into()));
-        assert_eq!(next_towards(home, home), None);
-        assert_eq!(next_towards(Path::new("/etc"), home), None);
-        assert_eq!(next_towards(Path::new("/home/user/docs"), home), None);
+    fn sized(name: &str, kind: Kind, size: u64, mtime: i64) -> Entry {
+        Entry { size, mtime, ..entry(name, kind) }
+    }
+
+    fn sorted_names(sort: Sort) -> Vec<String> {
+        let mut entries = vec![
+            sized("old-big", Kind::File, 900, 10),
+            sized("new-small", Kind::File, 1, 30),
+            sized("middle", Kind::File, 50, 20),
+            sized("twin", Kind::File, 50, 20),
+            sized("b-folder", Kind::Folder, 4096, 5),
+            sized("a-folder", Kind::Folder, 10, 40),
+        ];
+        entries.sort_by(|a, b| order(sort, a, b));
+        entries.into_iter().map(|entry| entry.name).collect()
     }
 
     #[test]
-    fn expanding_down_to_a_target_folder() {
-        let mut tree = tree_with_device();
-        let target = Path::new("/home/user");
-        let mut at = PathBuf::from("/");
-        let mut listings = vec![vec![folder("user"), folder("guest")], vec![folder("home"), folder("etc")]];
-        loop {
-            let row = tree.find(DEVICE, &at).unwrap();
-            let steps = tree.plan_expand(row);
-            run(&mut tree, steps);
-            let Some(listing) = listings.pop() else { break };
-            let steps = tree.plan_loaded(DEVICE, &at, Ok(listing));
-            run(&mut tree, steps);
-            match next_towards(&at, target) {
-                Some(next) => at = next,
-                None => break,
-            }
-        }
+    fn sort_criteria() {
         assert_eq!(
-            picture(&tree),
-            ["0:phone+", "1:etc", "1:home+", "2:guest", "2:user+", "3:<loading>"]
+            sorted_names(Sort::Name),
+            ["a-folder", "b-folder", "middle", "new-small", "old-big", "twin"]
         );
-        assert_eq!(tree.find(DEVICE, target), Some(4));
+        // newest first, folders still before files
+        assert_eq!(
+            sorted_names(Sort::Date),
+            ["a-folder", "b-folder", "new-small", "middle", "twin", "old-big"]
+        );
+        // biggest first, folders by name
+        assert_eq!(
+            sorted_names(Sort::Size),
+            ["a-folder", "b-folder", "old-big", "middle", "twin", "new-small"]
+        );
+    }
+
+    #[test]
+    fn changing_the_sort_reorders_every_level() {
+        let mut tree = tree_with_device();
+        let steps = tree.plan_add_device(1, "server", Path::new("/"));
+        run(&mut tree, steps);
+        expand(
+            &mut tree,
+            "/",
+            vec![sized("a", Kind::File, 1, 1), sized("b", Kind::File, 9, 2), folder("docs")],
+        );
+        expand(
+            &mut tree,
+            "/docs",
+            vec![sized("x", Kind::File, 5, 9), sized("y", Kind::File, 7, 3), sized(".h", Kind::File, 99, 99)],
+        );
+        assert_eq!(tree.sort(), Sort::Name);
+        assert_eq!(picture(&tree), ["0:phone+", "1:docs+", "2:x", "2:y", "1:a", "1:b", "0:server"]);
+
+        tree.set_sort(Sort::Size);
+        check(&tree);
+        assert_eq!(picture(&tree), ["0:phone+", "1:docs+", "2:y", "2:x", "1:b", "1:a", "0:server"]);
+        assert_eq!(tree.rows()[2].path, Path::new("/docs/y"));
+
+        tree.set_sort(Sort::Date);
+        check(&tree);
+        assert_eq!(picture(&tree), ["0:phone+", "1:docs+", "2:x", "2:y", "1:b", "1:a", "0:server"]);
+
+        // new and revealed items follow the current sort
+        let steps = tree.plan_upsert(DEVICE, Path::new("/docs"), sized("z", Kind::File, 0, 5));
+        run(&mut tree, steps);
+        tree.set_show_hidden(true);
+        assert_eq!(picture(&tree)[1..6], ["1:docs+", "2:.h", "2:x", "2:z", "2:y"]);
+        let steps = tree.plan_loaded(
+            DEVICE,
+            Path::new("/"),
+            Ok(vec![sized("old", Kind::File, 0, 1), sized("new", Kind::File, 0, 2)]),
+        );
+        run(&mut tree, steps);
+        assert_eq!(picture(&tree), ["0:phone+", "1:new", "1:old", "0:server"]);
+    }
+
+    #[test]
+    fn ratio_of_a_file_among_the_files_of_its_folder() {
+        let mut tree = tree_with_device();
+        expand(
+            &mut tree,
+            "/",
+            vec![
+                sized("a", Kind::File, 30, 0),
+                sized("b", Kind::File, 50, 0),
+                sized("docs", Kind::Folder, 4096, 0),
+                sized(".rc", Kind::File, 20, 0),
+            ],
+        );
+        assert_eq!(picture(&tree), ["0:phone+", "1:docs", "1:a", "1:b"]);
+        // the hidden file is part of the total, the folder is not
+        assert_eq!(tree.ratio(2), Some(0.3));
+        assert_eq!(tree.ratio(3), Some(0.5));
+        // devices, folders and unknown rows have none
+        assert_eq!(tree.ratio(0), None);
+        assert_eq!(tree.ratio(1), None);
+        assert_eq!(tree.ratio(99), None);
+
+        tree.set_show_hidden(true);
+        assert_eq!(tree.ratio(2), Some(0.2));
+        assert_eq!(tree.ratio(3), Some(0.3));
+    }
+
+    #[test]
+    fn ratios_are_per_folder_and_follow_changes() {
+        let mut tree = tree_with_device();
+        expand(&mut tree, "/", vec![folder("docs"), sized("a", Kind::File, 60, 0)]);
+        expand(&mut tree, "/docs", vec![sized("x", Kind::File, 30, 0), sized("y", Kind::File, 10, 0)]);
+        assert_eq!(picture(&tree), ["0:phone+", "1:docs+", "2:x", "2:y", "1:a"]);
+        assert_eq!(tree.ratio(2), Some(0.75));
+        assert_eq!(tree.ratio(3), Some(0.25));
+        // alone among the files of its folder, whatever the folders next to it hold
+        assert_eq!(tree.ratio(4), Some(1.0));
+
+        let steps = tree.plan_upsert(DEVICE, Path::new("/docs"), sized("x", Kind::File, 90, 0));
+        run(&mut tree, steps);
+        assert_eq!(tree.ratio(2), Some(0.9));
+        let steps = tree.plan_remove(DEVICE, Path::new("/docs/x"));
+        run(&mut tree, steps);
+        assert_eq!(tree.ratio(2), Some(1.0));
+    }
+
+    #[test]
+    fn empty_files_have_null_ratios() {
+        let mut tree = tree_with_device();
+        expand(&mut tree, "/", vec![sized("empty", Kind::File, 0, 0)]);
+        assert_eq!(tree.ratio(1), Some(0.0));
+    }
+
+    #[test]
+    fn current_folder_of_a_device() {
+        let mut tree = sample();
+        let steps = tree.plan_add_device(1, "server", Path::new("/srv"));
+        run(&mut tree, steps);
+        assert_eq!(tree.find_device(1), Some(tree.rows().len() - 1));
+        assert_eq!(tree.find_device(7), None);
+
+        let steps = tree.plan_set_current(DEVICE, Path::new("/home/user"));
+        assert!(matches!(steps[..], [Step::Remove { first: 1, count: 6 }, Step::Update { row: 0, .. }]));
+        run(&mut tree, steps);
+        assert_eq!(picture(&tree), ["0:phone", "0:server"]);
+        assert_eq!(tree.rows()[0].path, Path::new("/home/user"));
+        assert_eq!(tree.rows()[1].path, Path::new("/srv"));
+
+        // the tree of the device now starts from that folder
+        expand(&mut tree, "/home/user", vec![file("notes.txt"), file(".profile")]);
+        assert_eq!(picture(&tree), ["0:phone+", "1:notes.txt", "0:server"]);
+        assert_eq!(tree.rows()[1].path, Path::new("/home/user/notes.txt"));
+
+        // on a collapsed device only the path changes
+        let steps = tree.plan_collapse(0);
+        run(&mut tree, steps);
+        let steps = tree.plan_set_current(DEVICE, Path::new("/"));
+        assert!(matches!(steps[..], [Step::Update { row: 0, .. }]));
+        run(&mut tree, steps);
+        assert_eq!(picture(&tree), ["0:phone", "0:server"]);
+        assert_eq!(tree.plan_set_current(7, Path::new("/")), []);
     }
 }

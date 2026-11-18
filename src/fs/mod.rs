@@ -138,6 +138,22 @@ impl Fs {
         }
     }
 
+    /// copy an item, a folder with its content, into `folder`. returns the path of the copy.
+    /// fails if `folder` already has an item of this name
+    pub async fn copy_into(&self, source: &Path, folder: &Path) -> Result<PathBuf> {
+        match self {
+            Fs::Local(fs) => fs.copy_into(source, folder).await,
+        }
+    }
+
+    /// move an item into `folder`, returns its new path.
+    /// fails if `folder` already has an item of this name
+    pub async fn move_into(&self, source: &Path, folder: &Path) -> Result<PathBuf> {
+        match self {
+            Fs::Local(fs) => fs.move_into(source, folder).await,
+        }
+    }
+
     /// set the permission bits of an item
     pub async fn chmod(&self, path: &Path, mode: u32) -> Result<()> {
         match self {

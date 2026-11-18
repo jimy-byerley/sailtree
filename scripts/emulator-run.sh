@@ -6,7 +6,6 @@ set -e
 cd "$(dirname "$0")/.."
 SDK=${SDK:-$HOME/jolla/sdk}
 TARGET=${SFDK_TARGET:-SailfishOS-5.1.0.11-i486}
-EMULATOR=${SFDK_EMULATOR:-Sailfish OS Emulator 5.1.0.11}
 SSH_OPTIONS="-i $SDK/vmshare/ssh/private_keys/sdk -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes"
 HOST=defaultuser@127.0.0.1
 
@@ -14,7 +13,10 @@ if [ "$1" = "--no-build" ]; then shift; else
     "$SDK/bin/sfdk" -c target="$TARGET" build
 fi
 SHOT=${1:-target/screenshot.png}
-"$SDK/bin/sfdk" -c target="$TARGET" -c device="$EMULATOR" deploy --sdk
+# installed with rpm over ssh: `sfdk deploy --sdk` can wait forever for a confirmation on the emulator screen
+RPM=$(ls -t RPMS/sailtree-*.rpm | head -1)
+scp -P 2223 $SSH_OPTIONS "$RPM" root@127.0.0.1:/tmp/sailtree.rpm
+ssh -p 2223 $SSH_OPTIONS root@127.0.0.1 'rpm -U --force /tmp/sailtree.rpm && rm /tmp/sailtree.rpm'
 
 # the screenshot service only answers to the privileged group
 ssh -p 2223 $SSH_OPTIONS root@127.0.0.1 'id -Gn defaultuser | grep -qw privileged || usermod -a -G privileged defaultuser'
