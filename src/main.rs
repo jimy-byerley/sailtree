@@ -2,6 +2,7 @@ use std::ffi::CStr;
 
 mod config;
 mod devices;
+mod discovery;
 mod fs;
 mod model;
 mod opener;

@@ -11,6 +11,9 @@ qttypes = "0.2"
 cpp = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "time", "macros"] }
 libc = "0.2"
+ssh2 = "0.9"
+mdns-sd = "0.22"
+if-addrs = "0.15"
 
 [build-dependencies]
 cpp_build = "0.5"

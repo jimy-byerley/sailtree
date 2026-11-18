@@ -241,6 +241,35 @@ impl Tree {
         vec![Step::Insert { at: self.rows.len(), rows: vec![Row::device(device, name, current)] }]
     }
 
+    /// change the name shown for a device
+    pub fn plan_name_device(&self, device: DeviceId, name: &str) -> Vec<Step> {
+        let Some(row) = self.find_device(device) else { return Vec::new() };
+        vec![Step::Update { row, new: Row { name: name.to_owned(), ..self.rows[row].clone() } }]
+    }
+
+    /// take a device away, with everything shown under it
+    pub fn plan_remove_device(&self, device: DeviceId) -> Vec<Step> {
+        let Some(row) = self.find_device(device) else { return Vec::new() };
+        vec![Step::Remove { first: row, count: 1 + self.descendants(row) }]
+    }
+
+    /// put a device, with everything shown under it, before the device `before`, or last
+    pub fn plan_move_device(&self, device: DeviceId, before: Option<DeviceId>) -> Vec<Step> {
+        let Some(row) = self.find_device(device) else { return Vec::new() };
+        let count = 1 + self.descendants(row);
+        let target = match before.and_then(|before| self.find_device(before)) {
+            Some(target) => target,
+            None => self.rows.len(),
+        };
+        // already there, or asked to go before itself
+        if target == row || target == row + count {
+            return Vec::new();
+        }
+        let block = self.rows[row..row + count].to_vec();
+        let at = if target > row { target - count } else { target };
+        vec![Step::Remove { first: row, count }, Step::Insert { at, rows: block }]
+    }
+
     /// change the folder the tree of a device starts from. the device ends collapsed
     pub fn plan_set_current(&self, device: DeviceId, current: &Path) -> Vec<Step> {
         let Some(row) = self.find_device(device) else { return Vec::new() };
@@ -990,6 +1019,49 @@ mod tests {
         let mut tree = tree_with_device();
         expand(&mut tree, "/", vec![sized("empty", Kind::File, 0, 0)]);
         assert_eq!(tree.ratio(1), Some(0.0));
+    }
+
+    #[test]
+    fn devices_can_be_renamed_moved_and_removed() {
+        let mut tree = sample();
+        for (id, name) in [(1, "nas"), (2, "server")] {
+            let steps = tree.plan_add_device(id, name, Path::new("/"));
+            run(&mut tree, steps);
+        }
+        let devices = |tree: &Tree| -> Vec<String> {
+            tree.rows().iter().filter(|row| row.kind == RowKind::Device).map(|row| row.name.clone()).collect()
+        };
+        assert_eq!(devices(&tree), ["phone", "nas", "server"]);
+
+        let steps = tree.plan_name_device(1, "NAS");
+        run(&mut tree, steps);
+        assert_eq!(tree.plan_name_device(9, "none"), []);
+
+        // the phone goes last with everything under it
+        let steps = tree.plan_move_device(DEVICE, None);
+        run(&mut tree, steps);
+        assert_eq!(devices(&tree), ["NAS", "server", "phone"]);
+        assert_eq!(picture(&tree)[2..5], ["0:phone+", "1:etc+", "2:hosts"]);
+        assert_eq!(tree.rows().len(), 9);
+
+        let steps = tree.plan_move_device(DEVICE, Some(2));
+        run(&mut tree, steps);
+        assert_eq!(devices(&tree), ["NAS", "phone", "server"]);
+        let steps = tree.plan_move_device(2, Some(1));
+        run(&mut tree, steps);
+        assert_eq!(devices(&tree), ["server", "NAS", "phone"]);
+
+        // nothing to do: already there, before itself, unknown
+        assert_eq!(tree.plan_move_device(DEVICE, None), []);
+        assert_eq!(tree.plan_move_device(1, Some(DEVICE)), []);
+        assert_eq!(tree.plan_move_device(1, Some(1)), []);
+        assert_eq!(tree.plan_move_device(9, None), []);
+
+        let steps = tree.plan_remove_device(DEVICE);
+        assert_eq!(steps, [Step::Remove { first: 2, count: 7 }]);
+        run(&mut tree, steps);
+        assert_eq!(picture(&tree), ["0:server", "0:NAS"]);
+        assert_eq!(tree.plan_remove_device(DEVICE), []);
     }
 
     #[test]

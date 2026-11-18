@@ -12,6 +12,9 @@ BuildRequires:  rust >= 1.75
 BuildRequires:  cargo >= 1.75
 BuildRequires:  rust-std-static
 BuildRequires:  pkgconfig(sailfishapp) >= 1.0.2
+# ssh: libssh2 is built with the app and linked statically, on the system openssl and zlib
+BuildRequires:  pkgconfig(openssl)
+BuildRequires:  pkgconfig(zlib)
 BuildRequires:  pkgconfig(Qt5Core)
 BuildRequires:  pkgconfig(Qt5Gui)
 BuildRequires:  pkgconfig(Qt5Qml)

@@ -13,6 +13,10 @@ ListItem {
     // being selectable
     property bool picking: false
     signal picked()
+    // long press on a remote device
+    signal settingsRequested()
+
+    onPressAndHold: if (model.kind === "device" && model.remote) settingsRequested()
     // deeper rows are not indented further
     readonly property int maximumIndent: 6
 
@@ -60,11 +64,11 @@ ListItem {
             width: Theme.iconSizeSmallPlus
             height: width
             sourceSize.width: width
-            visible: model.kind !== "loading"
+            visible: model.kind !== "loading" && !model.busy
             highlighted: root.highlighted
             source: {
                 switch (model.kind) {
-                case "device": return "image://theme/icon-m-phone"
+                case "device": return model.remote ? "image://theme/icon-m-computer" : "image://theme/icon-m-phone"
                 case "folder": return "image://theme/icon-m-file-folder"
                 case "error": return "image://theme/icon-m-warning"
                 default: return Logic.fileIcon(model.name, Theme.colorScheme === Theme.LightOnDark)
@@ -75,7 +79,7 @@ ListItem {
         BusyIndicator {
             anchors.centerIn: icon
             size: BusyIndicatorSize.ExtraSmall
-            running: model.kind === "loading"
+            running: model.kind === "loading" || model.busy
         }
 
         Column {

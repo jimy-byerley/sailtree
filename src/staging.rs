@@ -35,6 +35,13 @@ pub fn stage(home: &Path, path: &Path) -> PathBuf {
     }
 }
 
+/// a new empty folder applications can see, for a file fetched from another device
+pub fn folder(home: &Path) -> io::Result<PathBuf> {
+    let folder = home.join(FOLDER).join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
+    fs::create_dir_all(&folder)?;
+    Ok(folder)
+}
+
 /// a new hard link to `path` under another name, for applications that judge a file by its name
 pub fn stage_as(home: &Path, path: &Path, name: impl AsRef<Path>) -> io::Result<PathBuf> {
     // one folder per link: the file keeps its name, which viewers show and guess the type from
@@ -109,6 +116,17 @@ mod tests {
         assert_ne!(again, staged);
         assert_eq!(fs::read(&other).unwrap(), b"other");
         assert_eq!(fs::read(&again).unwrap(), b"notes");
+    }
+
+    #[test]
+    fn folders_for_fetched_files() {
+        let dir = TempDir::new();
+        let home = dir.path();
+        let (first, second) = (folder(home).unwrap(), folder(home).unwrap());
+        assert_ne!(first, second);
+        assert!(first.is_dir() && visible(home, &first));
+        clean(home);
+        assert!(!first.exists());
     }
 
     #[test]

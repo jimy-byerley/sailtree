@@ -287,7 +287,7 @@ impl<E: Fn(Event) + Send + Sync> Run<'_, E> {
                 Some((_, Status::Partial)) | None => status = Status::Partial,
             }
         }
-        if !merge {
+        if !merge && entry.mode != 0 {
             // last, so the content of a read-only folder can be written
             job.to.chmod(destination, entry.mode).await?;
         }
@@ -297,7 +297,9 @@ impl<E: Fn(Event) + Send + Sync> Run<'_, E> {
     async fn file(&mut self, source: &Path, entry: &Entry, destination: &Path) -> Result<(), Stop> {
         let job = self.job;
         let mut reader = job.from.open(source).await?;
-        let mut writer = job.to.create(destination, entry.mode).await?;
+        // some devices do not tell the permissions of their files
+        let mode = if entry.mode == 0 { 0o644 } else { entry.mode };
+        let mut writer = job.to.create(destination, mode).await?;
         let copied: Result<(), Stop> = async {
             loop {
                 self.check()?;
@@ -401,6 +403,25 @@ mod tests {
         assert_eq!(fs::read_link(root.join("target/album/link")).unwrap(), Path::new("a.jpg"));
         assert!(root.join("note.txt").exists());
         assert!(root.join("album/deep/b.jpg").exists());
+    }
+
+    #[tokio::test]
+    async fn unknown_permissions_get_usual_ones() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = sample();
+        let root = dir.path();
+        // what a device not telling permissions looks like
+        fs::set_permissions(root.join("note.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+        fs::create_dir(root.join("empty")).unwrap();
+        fs::set_permissions(root.join("empty"), fs::Permissions::from_mode(0o000)).unwrap();
+        let (outcome, ..) = run_with(job(&dir, false, &["empty"], "target"), None).await;
+        fs::set_permissions(root.join("empty"), fs::Permissions::from_mode(0o755)).unwrap();
+        // the folder cannot be read here, but its copy was created usable
+        assert_eq!(outcome.errors.len(), 1);
+        let mode = fs::metadata(root.join("target/empty")).unwrap().permissions().mode();
+        assert_ne!(mode & 0o700, 0);
     }
 
     #[tokio::test]

@@ -27,6 +27,62 @@ TestCase {
     }
 
     Component {
+        id: deviceDialog
+        DeviceDialog { }
+    }
+
+    Component {
+        id: loginDialog
+        LoginDialog { }
+    }
+
+    function test_deviceDialogNeedsAHostAndAPort() {
+        var dialog = deviceDialog.createObject(null, {})
+        verify(dialog.adding)
+        verify(!dialog.canAccept)
+        compare(dialog.port, 22)
+        dialog.host = "nas.local"
+        verify(dialog.canAccept)
+        dialog.host = "my nas"
+        verify(!dialog.canAccept)
+        dialog.destroy()
+
+        dialog = deviceDialog.createObject(null, { adding: false, host: "10.0.0.2", initialPort: "2222", folder: "/srv" })
+        verify(dialog.canAccept)
+        compare(dialog.port, 2222)
+        compare(dialog.folder, "/srv")
+        dialog.destroy()
+
+        // changing the protocol changes the port, unless another one was typed
+        dialog = deviceDialog.createObject(null, { host: "10.0.0.2" })
+        compare(dialog.protocol, "sftp")
+        dialog.choose("ftp")
+        compare(dialog.protocol, "ftp")
+        compare(dialog.port, 21)
+        dialog.choose("sftp")
+        compare(dialog.port, 22)
+        dialog.destroy()
+        dialog = deviceDialog.createObject(null, { host: "10.0.0.2", initialPort: "2121" })
+        dialog.choose("ftp")
+        compare(dialog.port, 2121)
+        dialog.destroy()
+
+        dialog = deviceDialog.createObject(null, { host: "10.0.0.2", initialPort: "port" })
+        verify(!dialog.canAccept)
+        compare(dialog.port, 0)
+        dialog.destroy()
+    }
+
+    function test_loginDialogNeedsAUser() {
+        var dialog = loginDialog.createObject(null, { device: "NAS" })
+        verify(!dialog.canAccept)
+        dialog.user = "me"
+        verify(dialog.canAccept)
+        compare(dialog.savePassword, false)
+        dialog.destroy()
+    }
+
+    Component {
         id: permissionsDialog
         PermissionsDialog { }
     }

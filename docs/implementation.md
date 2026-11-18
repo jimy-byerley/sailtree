@@ -37,8 +37,8 @@
 - `NameDialog` serves rename and creation; `PermissionsDialog` has read/write/execute switches for owner, group, others
 - a device row has a second line with its current folder, one clickable label per level starting at `/`. a long path scrolls horizontally and shows its end
 - changing the current folder of a device expands it and brings it to the top of the view; clicking the last level lists the folder again
-- "add device" is the entry of a Silica pull-down menu on the list (disabled until remote devices exist)
-- nothing happens on a long press yet (the local device has no connection settings)
+- "add device" is the entry of a Silica pull-down menu on the list; it opens the connection settings of a new device
+- a long press on a remote device opens its connection settings; nothing happens on the local device, which has none
 - details are a second line under the name: permissions, owner (and group when different), date, link target, and for files the size last
 - file icons follow the file extension, among the kinds the theme has an icon for (image, audio, video, pdf, document, spreadsheet, presentation, formatted text, note, archive, apk, rpm, vcard)
 - a click on a file opens it with the application the system associates to it (`Qt.openUrlExternally`), see "opening files"
@@ -79,6 +79,20 @@
 - rename refuses a name already taken instead of overwriting
 - deleting a folder deletes its content; deleting a symlink never touches its target
 
+## remote devices
+
+- a remote device is reached through ssh (sftp) or FTP. its connection settings (`DeviceDialog`): protocol (the port follows it unless another one was typed), host, port, user, password with a "remember the password" switch, name shown in the list (the host by default), current folder, and the fingerprint of its key once trusted. the dialog also disconnects and forgets the device
+- clicking a device that is not connected connects it, then expands it. `LoginDialog` asks the user and password when no password is known, or after a refused one. a password not remembered is kept for the run only
+- the key of a device is checked: at the first connection, or when the key is not the trusted one anymore, `HostKeyDialog` shows its fingerprint (`SHA256:…`, as ssh tools print it) and connects only if the user trusts it
+- FTP: plain FTP only, nothing is encrypted, which the settings say when FTP is chosen. no key to trust. passive mode (`EPSV`, then `PASV` ignoring the address it announces). listings use `MLSD` when the server has it, asking for the unix permissions, owner and group, and fall back to parsing `LIST` (no dates then). each file being transferred has a connection of its own, browsing keeps the first one. links cannot be created through FTP; permissions a server does not tell are shown empty, and a file copied from there gets the usual `rw-r--r--`
+- servers asking the password as a question (keyboard-interactive) are answered with it; a server accepting no password is reported as such. key based login is not supported
+- a device starts in its remembered current folder, the home folder of the user the first time
+- categories: connected; online when the device answers on its port (checked when the app starts, then every 30 seconds while it is in use, and after a disconnection); offline otherwise. a device changing category moves, with what is shown under it, to the end of its new category
+- devices are remembered in the configuration (`[device N]` sections), with the password only if asked. at most 20: beyond, the least recently connected one is forgotten
+- owner and group of remote items are numbers: the protocol gives no names
+- copies and moves between devices go through the same transfer jobs. a remote file is opened by first fetching it to the folder used for temporary links, with the usual progress
+- the size ring is not shown on remote devices
+
 ## opening files
 
 - viewers are sandboxed (Sailjail) and only see `Documents`, `Downloads`, `Music`, `Pictures`, `Videos`, `Public` of the home folder and removable media (`/run/media`). a file there is opened in place
@@ -90,10 +104,12 @@
 ## discovery
 
 - no ARP: raw sockets need `CAP_NET_RAW`, unavailable to a regular app
-- `mdns-sd` crate browses `_sftp-ssh._tcp`, `_ssh._tcp`, `_ftp._tcp` continuously, so advertising hosts show up immediately with their `.local` name and port
-- a periodic TCP connect sweep of ports 22 and 21 over the local /24 completes the list (short timeout ~300ms, bounded concurrency), rerun on network change
-- hosts found only by the sweep get their name from the system reverse lookup (`getnameinfo` via `dns-lookup` crate), falling back to the IP
-- results from both sources are merged per IP address
+- `mdns-sd` crate browses `_sftp-ssh._tcp`, `_ssh._tcp` and `_ftp._tcp` continuously once the app looked at the network, so advertising hosts show up with their `.local` name and port
+- a TCP connect sweep of ports 22 then 21 over each local IPv4 network completes the list (300 ms per host, 32 at a time; a network bigger than a /24 is only swept around the address of the phone). it runs when the app starts and every 2 minutes while the app is in use
+- hosts found only by the sweep get their name from the system reverse lookup (`getnameinfo`), falling back to the address
+- a device offering both ssh and FTP is listed once, through ssh
+- results from both sources are merged per address, the addresses of the phone left out, as well as the devices already remembered (by host name, or by an address their host resolves to)
+- a discovered device is listed online, reached by its address, with no user: connecting asks for the login. it is not remembered until connected or edited, and leaves the list when it is not seen anymore
 
 ## transfers
 
@@ -103,12 +119,12 @@
 ## concurrency and backends
 
 - tokio runtime running in background threads; QML-invoked methods spawn onto it, results come back to the Qt thread with `qmetaobject::queued_callback`
-- SFTP via `russh` + `russh-sftp`: one shared session per device, operations run as concurrent tasks (browsing stays responsive during transfers)
-- FTP via `suppaftp` async: one operation at a time per control connection, transfers use a separate connection
+- SFTP via the `ssh2` crate (libssh2, built with the app and linked statically on the system openssl): one session per device, blocking calls run in `spawn_blocking`, one at a time on the session. transfers go by pieces, so browsing gets its turn between two of them
+- FTP by a client of our own on blocking sockets (`fs/ftp.rs`, no crate): one operation at a time on the control connection, transfers use a separate connection
 - local filesystem calls run in `spawn_blocking`
 - backends are dispatched through `enum Fs { Local, Sftp, Ftp }`, not a dyn trait
 - cancellation through task abort / cancellation token, network calls wrapped in `tokio::time::timeout`
-- discovery (mdns-sd receiver, port sweep with bounded concurrency, reverse lookup in `spawn_blocking`) runs on the same runtime
+- discovery runs as one blocking task of the same runtime: the sweep uses its own short lived threads, the mdns-sd daemon and its listeners their own
 
 ## repository structure
 
@@ -136,11 +152,10 @@ sailtree/
 │   ├── fs/                   filesystem backends
 │   │   ├── mod.rs            `enum Fs` and common operations
 │   │   ├── local.rs
-│   │   ├── sftp.rs           russh + russh-sftp
-│   │   └── ftp.rs            suppaftp
+│   │   ├── sftp.rs           ssh2 (libssh2)
+│   │   └── ftp.rs            own client on blocking sockets
 │   ├── devices/
-│   │   ├── mod.rs            device identity, connected/online/offline state, merging discovery results
-│   │   └── auth.rs           credentials, ssh host key verification
+│   │   └── mod.rs            device identity, connected/online/offline state, how devices are remembered
 │   ├── discovery/
 │   │   ├── mdns.rs           mdns-sd browsing
 │   │   ├── scan.rs           TCP sweep on ports 22/21
@@ -150,7 +165,7 @@ sailtree/
 │       └── conflict.rs       overwrite / skip / keep both
 ├── qml/                      installed to /usr/share/sailtree/qml, not embedded
 │   ├── sailtree.qml          ApplicationWindow
-│   ├── pages/                full pages and dialogs (MainPage, AddDeviceDialog, LoginDialog, NameDialog, PermissionsDialog, ConflictDialog)
+│   ├── pages/                full pages and dialogs (MainPage, DeviceDialog, LoginDialog, HostKeyDialog, NameDialog, PermissionsDialog, ConflictDialog)
 │   ├── components/           reusable items (TreeDelegate, SelectionCircle, SelectionActions, ActionButton)
 │   ├── icons/                action icons missing from the theme, svg
 │   ├── js/logic.js           interface logic without visual items (formatting, validation, permission bits)

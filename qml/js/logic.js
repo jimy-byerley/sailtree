@@ -129,6 +129,22 @@ function transferLabel(moving, name, waiting) {
     return waiting > 0 ? text + " (+" + waiting + ")" : text
 }
 
+// whether a text can be the address of a device: a name or number without spaces
+function validHost(host) {
+    return host.length > 0 && !/[\s\/]/.test(host)
+}
+
+// usual port of a protocol, as text
+function defaultPort(protocol) {
+    return protocol === "ftp" ? "21" : "22"
+}
+
+// whether a text is a port number
+function validPort(port) {
+    var text = "" + port
+    return /^[0-9]{1,5}$/.test(text) && parseInt(text, 10) >= 1 && parseInt(text, 10) <= 65535
+}
+
 // capitalized category name for section headers
 function title(text) {
     return text.length > 0 ? text.charAt(0).toUpperCase() + text.slice(1) : text

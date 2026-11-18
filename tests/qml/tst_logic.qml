@@ -161,6 +161,31 @@ TestCase {
         compare(Logic.transferLabel(true, "album", 2), "Moving album (+2)")
     }
 
+    function test_validHost() {
+        verify(Logic.validHost("nas.local"))
+        verify(Logic.validHost("192.168.1.20"))
+        verify(Logic.validHost("fe80::1"))
+        verify(!Logic.validHost(""))
+        verify(!Logic.validHost("my nas"))
+        verify(!Logic.validHost("host/path"))
+    }
+
+    function test_defaultPort() {
+        compare(Logic.defaultPort("sftp"), "22")
+        compare(Logic.defaultPort("ftp"), "21")
+    }
+
+    function test_validPort() {
+        verify(Logic.validPort("22"))
+        verify(Logic.validPort(2222))
+        verify(Logic.validPort("65535"))
+        verify(!Logic.validPort(""))
+        verify(!Logic.validPort("0"))
+        verify(!Logic.validPort("65536"))
+        verify(!Logic.validPort("22a"))
+        verify(!Logic.validPort("-1"))
+    }
+
     function test_title() {
         compare(Logic.title("connected"), "Connected")
         compare(Logic.title(""), "")

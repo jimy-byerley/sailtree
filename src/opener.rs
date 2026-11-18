@@ -52,6 +52,11 @@ pub fn file_url(path: &Path) -> String {
 
 /// name of the application registered first for a content type
 fn application(mime: &str) -> Option<String> {
+    // unit tests run under the build sandbox, where starting a process from a threaded
+    // program can freeze: no application is known there
+    if cfg!(test) {
+        return None;
+    }
     let output = Command::new(LAUNCHER).args(["--actionsformime", mime]).output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     text.lines().map(str::trim).find(|line| !line.is_empty()).map(str::to_owned)

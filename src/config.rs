@@ -64,7 +64,6 @@ impl Config {
         }
     }
 
-    #[allow(dead_code)] // used with remote devices
     /// names of the sections starting with `prefix`, without it
     pub fn sections(&self, prefix: &str) -> Vec<String> {
         self.sections.keys().filter_map(|name| name.strip_prefix(prefix)).map(str::to_owned).collect()
@@ -79,14 +78,12 @@ impl Config {
         }
     }
 
-    #[allow(dead_code)] // used with remote devices
     pub fn remove(&mut self, section: &str, key: &str) {
         if self.sections.get_mut(section).and_then(|values| values.remove(key)).is_some() {
             self.save();
         }
     }
 
-    #[allow(dead_code)] // used with remote devices
     pub fn remove_section(&mut self, section: &str) {
         if self.sections.remove(section).is_some() {
             self.save();

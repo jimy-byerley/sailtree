@@ -1,6 +1,8 @@
 //! filesystem backends behind one common set of operations
 
+pub mod ftp;
 pub mod local;
+pub mod sftp;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -85,6 +87,8 @@ pub type Result<T> = std::result::Result<T, FsError>;
 #[derive(Debug, Clone)]
 pub enum Fs {
     Local(local::Local),
+    Sftp(sftp::Sftp),
+    Ftp(ftp::Ftp),
 }
 
 impl Fs {
@@ -92,6 +96,8 @@ impl Fs {
     pub fn home(&self) -> PathBuf {
         match self {
             Fs::Local(fs) => fs.home(),
+            Fs::Sftp(fs) => fs.home(),
+            Fs::Ftp(fs) => fs.home(),
         }
     }
 
@@ -99,6 +105,8 @@ impl Fs {
     pub async fn list(&self, path: &Path) -> Result<Vec<Entry>> {
         match self {
             Fs::Local(fs) => fs.list(path).await,
+            Fs::Sftp(fs) => fs.list(path).await,
+            Fs::Ftp(fs) => fs.list(path).await,
         }
     }
 
@@ -106,6 +114,8 @@ impl Fs {
     pub async fn stat(&self, path: &Path) -> Result<Entry> {
         match self {
             Fs::Local(fs) => fs.stat(path).await,
+            Fs::Sftp(fs) => fs.stat(path).await,
+            Fs::Ftp(fs) => fs.stat(path).await,
         }
     }
 
@@ -115,6 +125,8 @@ impl Fs {
         validate_name(name)?;
         match self {
             Fs::Local(fs) => fs.rename(path, name).await,
+            Fs::Sftp(fs) => fs.rename(path, name).await,
+            Fs::Ftp(fs) => fs.rename(path, name).await,
         }
     }
 
@@ -122,6 +134,8 @@ impl Fs {
     pub async fn delete(&self, path: &Path) -> Result<()> {
         match self {
             Fs::Local(fs) => fs.delete(path).await,
+            Fs::Sftp(fs) => fs.delete(path).await,
+            Fs::Ftp(fs) => fs.delete(path).await,
         }
     }
 
@@ -130,6 +144,8 @@ impl Fs {
         validate_name(name)?;
         match self {
             Fs::Local(fs) => fs.mkdir(parent, name).await,
+            Fs::Sftp(fs) => fs.mkdir(parent, name).await,
+            Fs::Ftp(fs) => fs.mkdir(parent, name).await,
         }
     }
 
@@ -138,6 +154,8 @@ impl Fs {
         validate_name(name)?;
         match self {
             Fs::Local(fs) => fs.create_file(parent, name).await,
+            Fs::Sftp(fs) => fs.create_file(parent, name).await,
+            Fs::Ftp(fs) => fs.create_file(parent, name).await,
         }
     }
 
@@ -146,6 +164,8 @@ impl Fs {
     pub async fn rename_to(&self, from: &Path, to: &Path) -> Result<()> {
         match self {
             Fs::Local(fs) => fs.rename_to(from, to).await,
+            Fs::Sftp(fs) => fs.rename_to(from, to).await,
+            Fs::Ftp(fs) => fs.rename_to(from, to).await,
         }
     }
 
@@ -153,6 +173,8 @@ impl Fs {
     pub async fn symlink(&self, target: &Path, path: &Path) -> Result<()> {
         match self {
             Fs::Local(fs) => fs.symlink(target, path).await,
+            Fs::Sftp(fs) => fs.symlink(target, path).await,
+            Fs::Ftp(_) => Err(FsError::Other(format!("{}: links cannot be made through FTP", path.display()))),
         }
     }
 
@@ -160,6 +182,8 @@ impl Fs {
     pub async fn open(&self, path: &Path) -> Result<Reader> {
         match self {
             Fs::Local(fs) => Ok(Reader::Local(fs.open(path).await?)),
+            Fs::Sftp(fs) => Ok(Reader::Sftp(fs.open(path).await?)),
+            Fs::Ftp(fs) => Ok(Reader::Ftp(fs.open(path).await?)),
         }
     }
 
@@ -167,6 +191,8 @@ impl Fs {
     pub async fn create(&self, path: &Path, mode: u32) -> Result<Writer> {
         match self {
             Fs::Local(fs) => Ok(Writer::Local(fs.create(path, mode & 0o7777).await?)),
+            Fs::Sftp(fs) => Ok(Writer::Sftp(fs.create(path, mode & 0o7777).await?)),
+            Fs::Ftp(fs) => Ok(Writer::Ftp(fs.create(path, mode & 0o7777).await?)),
         }
     }
 
@@ -174,6 +200,8 @@ impl Fs {
     pub async fn chmod(&self, path: &Path, mode: u32) -> Result<()> {
         match self {
             Fs::Local(fs) => fs.chmod(path, mode & 0o7777).await,
+            Fs::Sftp(fs) => fs.chmod(path, mode & 0o7777).await,
+            Fs::Ftp(fs) => fs.chmod(path, mode & 0o7777).await,
         }
     }
 }
@@ -185,6 +213,8 @@ pub const PIECE: usize = 256 * 1024;
 #[derive(Debug)]
 pub enum Reader {
     Local(local::LocalFile),
+    Sftp(sftp::SftpFile),
+    Ftp(ftp::FtpFile),
 }
 
 impl Reader {
@@ -192,6 +222,8 @@ impl Reader {
     pub async fn read(&mut self) -> Result<Vec<u8>> {
         match self {
             Reader::Local(file) => file.read(PIECE).await,
+            Reader::Sftp(file) => file.read(PIECE).await,
+            Reader::Ftp(file) => file.read(PIECE).await,
         }
     }
 }
@@ -200,19 +232,24 @@ impl Reader {
 #[derive(Debug)]
 pub enum Writer {
     Local(local::LocalFile),
+    Sftp(sftp::SftpFile),
+    Ftp(ftp::FtpFile),
 }
 
 impl Writer {
     pub async fn write(&mut self, data: Vec<u8>) -> Result<()> {
         match self {
             Writer::Local(file) => file.write(data).await,
+            Writer::Sftp(file) => file.write(data).await,
+            Writer::Ftp(file) => file.write(data).await,
         }
     }
 
     /// everything was written
     pub async fn finish(self) -> Result<()> {
         match self {
-            Writer::Local(_) => Ok(()),
+            Writer::Local(_) | Writer::Sftp(_) => Ok(()),
+            Writer::Ftp(file) => file.finish().await,
         }
     }
 }

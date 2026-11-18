@@ -25,6 +25,32 @@ Page {
             dialog.accepted.connect(function() { treeModel.resolveConflict(dialog.answer, dialog.all) })
             dialog.rejected.connect(function() { treeModel.resolveConflict("skip", false) })
         }
+        onLoginRequired: {
+            var id = deviceIdAt(row)
+            pageStack.completeAnimation()
+            var dialog = pageStack.push(Qt.resolvedUrl("LoginDialog.qml"), {
+                device: deviceText(row, "name"),
+                user: deviceText(row, "user"),
+                savePassword: deviceSavesPassword(row)
+            })
+            if (dialog)
+                dialog.accepted.connect(function() {
+                    treeModel.login(treeModel.deviceRow(id), dialog.user, dialog.password, dialog.savePassword)
+                })
+        }
+        onHostKeyUnknown: {
+            var id = deviceIdAt(row)
+            pageStack.completeAnimation()
+            var dialog = pageStack.push(Qt.resolvedUrl("HostKeyDialog.qml"), {
+                device: deviceText(row, "name"),
+                fingerprint: fingerprint,
+                changed: changed
+            })
+            if (dialog)
+                dialog.accepted.connect(function() {
+                    treeModel.trustHost(treeModel.deviceRow(id), fingerprint)
+                })
+        }
         onOpenRequested: Qt.openUrlExternally(Logic.fileUrl(path))
         onRevealed: list.positionViewAtIndex(row, top ? ListView.Beginning : ListView.Contain)
         // each drop-down belongs to one state of the top bar
@@ -86,6 +112,57 @@ Page {
             if (treeModel.selectedRow >= 0)
                 treeModel.chmod(treeModel.selectedRow, dialog.mode)
         })
+    }
+
+    function addDevice() {
+        var dialog = pageStack.push(Qt.resolvedUrl("DeviceDialog.qml"), { adding: true })
+        dialog.accepted.connect(function() {
+            var id = treeModel.addDevice(dialog.name, dialog.host, dialog.port, dialog.user, dialog.password,
+                                         dialog.savePassword)
+            treeModel.setProtocol(treeModel.deviceRow(id), dialog.protocol)
+        })
+    }
+
+    // rows move when devices change category: a device is followed by its identifier
+    function editDevice(row) {
+        var id = treeModel.deviceIdAt(row)
+        var dialog = pageStack.push(Qt.resolvedUrl("DeviceDialog.qml"), {
+            adding: false,
+            connected: treeModel.deviceConnected(row),
+            protocol: treeModel.deviceText(row, "protocol"),
+            name: treeModel.deviceText(row, "name"),
+            host: treeModel.deviceText(row, "host"),
+            initialPort: treeModel.deviceText(row, "port"),
+            user: treeModel.deviceText(row, "user"),
+            password: treeModel.deviceText(row, "password"),
+            savePassword: treeModel.deviceSavesPassword(row),
+            fingerprint: treeModel.deviceText(row, "fingerprint"),
+            folder: treeModel.deviceText(row, "folder")
+        })
+        dialog.accepted.connect(function() {
+            treeModel.setProtocol(treeModel.deviceRow(id), dialog.protocol)
+            treeModel.updateDevice(treeModel.deviceRow(id), dialog.name, dialog.host, dialog.port, dialog.user,
+                                   dialog.password, dialog.savePassword, dialog.folder)
+        })
+        dialog.disconnectRequested.connect(function() { treeModel.disconnect(treeModel.deviceRow(id)) })
+        dialog.forgetRequested.connect(function() { treeModel.removeDevice(treeModel.deviceRow(id)) })
+    }
+
+    // devices answering on the network are looked for while the app is in use
+    Timer {
+        interval: 30000
+        repeat: true
+        running: Qt.application.active
+        triggeredOnStart: true
+        onTriggered: treeModel.probe()
+    }
+
+    Timer {
+        interval: 120000
+        repeat: true
+        running: Qt.application.active
+        triggeredOnStart: true
+        onTriggered: treeModel.discover()
     }
 
     RemorsePopup {
@@ -301,8 +378,7 @@ Page {
         PullDownMenu {
             MenuItem {
                 text: qsTr("Add device")
-                // comes with remote devices
-                enabled: false
+                onClicked: page.addDevice()
             }
         }
 
@@ -317,6 +393,7 @@ Page {
             showDetails: treeModel.showDetails
             picking: treeModel.pendingCount > 0
             onPicked: treeModel.transferTo(model.index)
+            onSettingsRequested: page.editDevice(model.index)
         }
 
         VerticalScrollDecorator { }

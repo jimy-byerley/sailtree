@@ -28,7 +28,7 @@ make a local and remote file explorer app
 - gui: QML with sailfish silica and qmetaobject-rs
 - package: rpm, targetting chum repo
 
-# ui definition
+# layout
 
 main page is a list of devices in 3 categories
 
