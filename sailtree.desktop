@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Sailtree
+Icon=sailtree
+Exec=sailtree
+X-Nemo-Application-Type=no-invoker
+
+[X-Sailjail]
+Sandboxing=Disabled

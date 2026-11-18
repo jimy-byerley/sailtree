@@ -41,7 +41,9 @@ guideline for where new files go, not an exhaustive list
 sailtree/
 ├── Cargo.toml                single crate, no workspace
 ├── build.rs                  compiles the C++ shim (cpp crate) for SailfishApp::application()
-├── .cargo/config.toml        vendored crates source, for offline Chum/OBS builds
+├── Cargo.lock                committed, crate versions building with the SDK's rust
+├── .cargo/config.toml        cargo settings (rust-version aware resolution, later vendored sources for offline Chum/OBS builds)
+├── scripts/                  development helpers (cargo in the SDK target, emulator run)
 ├── src/
 │   ├── main.rs               startup, type registration, main QML loading
 │   ├── sailfishapp.rs        rust side of the SailfishApp shim
@@ -79,4 +81,13 @@ sailtree/
 ```
 
 - `vendor/` is generated at packaging time (`cargo vendor`), not committed
-- the C++ shim is assumed necessary for proper Silica integration; to be verified when scaffolding
+- startup goes through a C++ shim calling `SailfishApp::application()` / `createView()` / `pathToMainQml()`
+
+## build and test
+
+- crate versions are limited to those building with the rust of the Sailfish SDK target (`rust-version` in `Cargo.toml`); `Cargo.lock` is regenerated on the host with `cargo generate-lockfile`
+- `scripts/target-cargo.sh <cargo args>` runs cargo inside the SDK target, eg. `scripts/target-cargo.sh test`. unit tests only run there, the host has no Qt/Silica
+- `sfdk -c target=SailfishOS-5.1.0.11-i486 build` produces `RPMS/sailtree-*.rpm`
+- `scripts/emulator-run.sh [--no-build] [file.png]` builds, installs in the SDK emulator, starts the app, prints its output and saves a screenshot. it never targets a real device
+- only the i486 target (emulator) is built for now
+- the desktop file uses `X-Nemo-Application-Type=no-invoker`: the rust binary is started directly, without the booster

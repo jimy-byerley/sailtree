@@ -1,0 +1,4 @@
+# pick crate versions that build with the rust version of the Sailfish SDK (package.rust-version)
+# when the lock file is updated with a recent cargo
+[resolver]
+incompatible-rust-versions = "fallback"

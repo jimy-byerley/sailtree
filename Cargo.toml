@@ -1,0 +1,20 @@
+[package]
+name = "sailtree"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Local and remote file explorer for Sailfish OS"
+
+[dependencies]
+qmetaobject = "0.2"
+qttypes = "0.2"
+cpp = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "time", "macros"] }
+libc = "0.2"
+
+[build-dependencies]
+cpp_build = "0.5"
+
+[profile.release]
+lto = "thin"
+panic = "unwind"

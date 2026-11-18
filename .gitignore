@@ -2,3 +2,5 @@ target/
 vendor/
 RPMS/
 *.rpm
+.sfdk/
+documentation.list
