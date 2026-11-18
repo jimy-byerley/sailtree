@@ -115,8 +115,8 @@ pub struct TreeModel {
 
     /// an operation failed, with a message for the user
     failed: qt_signal!(message: QString),
-    /// this row should be brought into view
-    revealed: qt_signal!(row: i32),
+    /// this row should be brought into view, at the top of the view if `top`
+    revealed: qt_signal!(row: i32, top: bool),
 
     /// expand or collapse a device or folder
     toggle: qt_method!(fn(&mut self, row: i32)),
@@ -131,6 +131,10 @@ pub struct TreeModel {
     createFile: qt_method!(fn(&mut self, row: i32, name: QString)),
     /// set the permission bits of a file or folder
     chmod: qt_method!(fn(&mut self, row: i32, mode: i32)),
+    /// name of the item at `row`, empty for an unknown row
+    nameAt: qt_method!(fn(&self, row: i32) -> QString),
+    /// permission bits of the item at `row`
+    modeAt: qt_method!(fn(&self, row: i32) -> i32),
     /// select or unselect a file or folder
     toggleSelected: qt_method!(fn(&mut self, row: i32)),
     clearSelection: qt_method!(fn(&mut self)),
@@ -340,7 +344,7 @@ impl TreeModel {
             _ => {
                 self.state.reveal = None;
                 if let Some(row) = self.state.tree.find(device, path) {
-                    self.revealed(row as i32);
+                    self.revealed(row as i32, true);
                 }
             }
         }
@@ -383,7 +387,7 @@ impl TreeModel {
         let steps = self.state.tree.plan_upsert(device, folder, entry);
         self.run(steps);
         if let Some(row) = self.state.tree.find(device, path) {
-            self.revealed(row as i32);
+            self.revealed(row as i32, false);
         }
     }
 
@@ -457,6 +461,16 @@ impl TreeModel {
                 Err(error) => this.report(error),
             },
         );
+    }
+
+    #[allow(non_snake_case)]
+    fn nameAt(&self, row: i32) -> QString {
+        self.row(row).map_or_else(QString::default, |row| QString::from(row.name.as_str()))
+    }
+
+    #[allow(non_snake_case)]
+    fn modeAt(&self, row: i32) -> i32 {
+        self.row(row).and_then(|row| row.entry.as_ref()).map_or(0, |entry| entry.mode as i32)
     }
 
     #[allow(non_snake_case)]
@@ -968,6 +982,20 @@ mod tests {
         assert!(!dir.path().join("home/user/notes.txt").exists());
         assert_eq!(model.selection_count(), 1);
         assert_eq!(model.selected_row(), row_of(&model, "hosts"));
+    }
+
+    #[test]
+    fn name_and_mode_of_a_row() {
+        let (dir, mut model) = sample();
+        fs::set_permissions(dir.path().join("home/user/notes.txt"), fs::Permissions::from_mode(0o604)).unwrap();
+        model.toggle(0);
+        let notes = row_of(&model, "notes.txt");
+        assert_eq!(model.nameAt(notes).to_string(), "notes.txt");
+        assert_eq!(model.modeAt(notes), 0o604);
+        assert_eq!(model.nameAt(0).to_string(), "phone");
+        assert_eq!(model.modeAt(0), 0);
+        assert_eq!(model.nameAt(99).to_string(), "");
+        assert_eq!(model.modeAt(-1), 0);
     }
 
     #[test]

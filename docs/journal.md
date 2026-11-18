@@ -13,3 +13,6 @@
 - 2026-11-18: skeleton rpm builds (about 3 min for a release build from scratch), installs and starts in the emulator through the SailfishApp C++ shim; Silica page renders. qmetaobject 0.2.10 works with Qt 5.6.3.
 - 2026-11-18: emulator screenshots: `VBoxManage screenshotpng` gives a garbled image; the lipstick dbus `saveScreenshot` call works once `defaultuser` is in the `privileged` group and the call runs under `sg privileged` (done by `scripts/emulator-run.sh`, emulator only).
 - 2026-11-18: the spec's `License` tag is a placeholder (`LicenseRef-TBD`), to be chosen by the architect.
+- 2026-11-18: `qmltestrunner` needs `qt5-qtdeclarative-devel-tools` (added to BuildRequires) and only starts with the `minimal` Qt platform in the build target (`offscreen` aborts). Silica components load there, so dialogs can be unit tested.
+- 2026-11-18: interface checked in the emulator through screenshots. simulated touches (raw events written to the VirtualBox pointer device) did not land where expected, so interactive states were reached with a temporary copy of the main page driven by a timer, installed in the emulator only. taps, long press menu, remorse countdown and opening a file are not verified by hand yet.
+- 2026-11-18: toggling hidden files resets the model, which scrolls the list back to the top.

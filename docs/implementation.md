@@ -19,6 +19,21 @@
 - what stops being displayed (collapsed folder, hidden items turned off, refreshed listing) is removed from the selection, so no action applies to something the user does not see
 - devices are not selectable yet: no action applies to the local device
 
+## main page
+
+- top bar without selection: menu button, app name, `+` button. each button opens a drop-down under the bar that pushes the list down
+  - menu: "show details" and "show hidden files" switches
+  - `+`: device (disabled until remote devices exist), folder, file
+- top bar with a selection: clear, count, then rename and permissions (enabled for a single item) and delete
+- delete starts after the usual Silica remorse countdown, which lets the user cancel
+- `NameDialog` serves rename and creation; `PermissionsDialog` has read/write/execute switches for owner, group, others
+- a long press on a device or folder opens a menu: new folder, new file, refresh
+- details are a second line under the name: permissions, owner (and group when different), size for files, date, link target
+- a click on a file opens it with `Qt.openUrlExternally`
+- rows are indented by depth up to 6 levels, deeper ones stay at the same indentation
+- failed operations show a Silica notice with the error message
+- the page expands the local device when it opens
+
 ## local device
 
 - always present and connected from the start (no connection step), listed first, named after the hostname
@@ -62,7 +77,8 @@ sailtree/
 ├── .cargo/config.toml        cargo settings (rust-version aware resolution, later vendored sources for offline Chum/OBS builds)
 ├── scripts/                  development helpers (cargo in the SDK target, emulator run)
 ├── src/
-│   ├── main.rs               startup, type registration, main QML loading
+│   ├── main.rs               startup, type registration (QML module `Sailtree 1.0`)
+│   ├── testing.rs            helpers shared by the rust unit tests
 │   ├── sailfishapp.rs        rust side of the SailfishApp shim
 │   ├── runtime.rs            tokio runtime, bridge to the Qt thread (queued_callback)
 │   ├── config.rs             recents, manual devices, settings (~/.config/sailtree)
@@ -87,9 +103,11 @@ sailtree/
 │       └── conflict.rs       overwrite / skip / rename
 ├── qml/                      installed to /usr/share/sailtree/qml, not embedded
 │   ├── sailtree.qml          ApplicationWindow
-│   ├── pages/                full pages and dialogs (MainPage, AddDeviceDialog, LoginDialog, RenameDialog, PermissionsDialog)
+│   ├── pages/                full pages and dialogs (MainPage, AddDeviceDialog, LoginDialog, NameDialog, PermissionsDialog)
 │   ├── components/           reusable items (TreeDelegate, SelectionCircle, SelectionActions)
+│   ├── js/logic.js           interface logic without visual items (formatting, validation, permission bits)
 │   └── cover/                CoverPage
+├── tests/qml/                QML unit tests (QtTest), rust unit tests stay next to the code
 ├── icons/<size>/sailtree.png sizes 86x86, 108x108, 128x128, 172x172
 ├── sailtree.desktop          with [X-Sailjail] Sandboxing=Disabled
 ├── rpm/sailtree.spec         offline cargo build and install
@@ -104,6 +122,8 @@ sailtree/
 
 - crate versions are limited to those building with the rust of the Sailfish SDK target (`rust-version` in `Cargo.toml`); `Cargo.lock` is regenerated on the host with `cargo generate-lockfile`
 - `scripts/target-cargo.sh <cargo args>` runs cargo inside the SDK target, eg. `scripts/target-cargo.sh test`. unit tests only run there, the host has no Qt/Silica
+- `scripts/target-qmltest.sh` runs the QML unit tests of `tests/qml` inside the SDK target (`qmltestrunner`, `minimal` Qt platform)
+- every step comes with its unit tests; filesystem tests work in temporary folders, the tree model is tested against a temporary folder without a GUI
 - `sfdk -c target=SailfishOS-5.1.0.11-i486 build` produces `RPMS/sailtree-*.rpm`
 - `scripts/emulator-run.sh [--no-build] [file.png]` builds, installs in the SDK emulator, starts the app, prints its output and saves a screenshot. it never targets a real device
 - only the i486 target (emulator) is built for now

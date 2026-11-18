@@ -15,7 +15,9 @@ BuildRequires:  pkgconfig(Qt5Core)
 BuildRequires:  pkgconfig(Qt5Gui)
 BuildRequires:  pkgconfig(Qt5Qml)
 BuildRequires:  pkgconfig(Qt5Quick)
+# QML unit tests (scripts/target-qmltest.sh)
 BuildRequires:  qt5-qtdeclarative-import-qttest
+BuildRequires:  qt5-qtdeclarative-devel-tools
 BuildRequires:  desktop-file-utils
 
 %description
