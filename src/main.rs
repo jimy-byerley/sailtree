@@ -1,5 +1,6 @@
 use std::ffi::CStr;
 
+mod config;
 mod devices;
 mod fs;
 mod model;
@@ -7,6 +8,7 @@ mod opener;
 mod runtime;
 mod sailfishapp;
 mod staging;
+mod transfer;
 #[cfg(test)]
 mod testing;
 

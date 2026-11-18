@@ -121,6 +121,46 @@ TestCase {
         compare(crumbs[2].path, "/srv/files")
     }
 
+    function test_fileKind_data() {
+        return [
+            { name: "photo.jpg", kind: "image" },
+            { name: "PHOTO.JPEG", kind: "image" },
+            { name: "song.flac", kind: "audio" },
+            { name: "film.mkv", kind: "video" },
+            { name: "paper.pdf", kind: "pdf" },
+            { name: "letter.odt", kind: "document" },
+            { name: "budget.xlsx", kind: "spreadsheet" },
+            { name: "talk.odp", kind: "presentation" },
+            { name: "page.html", kind: "formatted" },
+            { name: "notes.txt", kind: "note" },
+            { name: "backup.tar.gz", kind: "compressed" },
+            { name: "app.apk", kind: "apk" },
+            { name: "app.rpm", kind: "rpm" },
+            { name: "friend.vcf", kind: "vcard" },
+            { name: "unknown.xyz", kind: "other" },
+            { name: "Makefile", kind: "other" },
+            { name: ".png", kind: "other" },
+            { name: "", kind: "other" }
+        ]
+    }
+
+    function test_fileKind(data) {
+        compare(Logic.fileKind(data.name), data.kind)
+    }
+
+    function test_fileIcon() {
+        compare(Logic.fileIcon("photo.jpg", true), "image://theme/icon-m-file-image")
+        compare(Logic.fileIcon("photo.jpg", false), "image://theme/icon-m-file-image")
+        compare(Logic.fileIcon("paper.pdf", true), "image://theme/icon-m-file-pdf-dark")
+        compare(Logic.fileIcon("paper.pdf", false), "image://theme/icon-m-file-pdf-light")
+        compare(Logic.fileIcon("unknown", true), "image://theme/icon-m-file-other-dark")
+    }
+
+    function test_transferLabel() {
+        compare(Logic.transferLabel(false, "photo.jpg", 0), "Copying photo.jpg")
+        compare(Logic.transferLabel(true, "album", 2), "Moving album (+2)")
+    }
+
     function test_title() {
         compare(Logic.title("connected"), "Connected")
         compare(Logic.title(""), "")

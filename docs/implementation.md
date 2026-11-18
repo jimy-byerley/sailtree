@@ -40,6 +40,7 @@
 - "add device" is the entry of a Silica pull-down menu on the list (disabled until remote devices exist)
 - nothing happens on a long press yet (the local device has no connection settings)
 - details are a second line under the name: permissions, owner (and group when different), date, link target, and for files the size last
+- file icons follow the file extension, among the kinds the theme has an icon for (image, audio, video, pdf, document, spreadsheet, presentation, formatted text, note, archive, apk, rpm, vcard)
 - a click on a file opens it with the application the system associates to it (`Qt.openUrlExternally`), see "opening files"
 - rows are indented by depth up to 6 levels, deeper ones stay at the same indentation
 - failed operations show a Silica notice with the error message
@@ -56,15 +57,24 @@
 
 - copy or move in the selection actions keeps the selected files and folders aside and clears the selection. the top bar then shows "Copy/Move n items to…" with a cancel button, and device and folder rows show a button instead of the selection circle: it starts the transfer into that folder, or into the current folder of that device
 - the items kept aside do not depend on what is displayed, so the tree can be browsed and the current folder changed to reach the destination
-- nothing is replaced: an item whose name is taken in the destination is refused, like a folder into itself, and reported; the other items still go
-- a copy keeps symbolic links as links and the permissions; a move to another filesystem is a copy followed by a deletion
+- transfers run one at a time, the next ones wait (`transfer/job.rs` does one, the model holds the queue). items coming from several devices make one transfer per device
+- files travel by pieces of 256 KiB through the common `Fs` operations, so the same code serves inside a device and between two. inside a device a move is first tried as a rename, which is immediate on the same filesystem
+- a row under the top bar shows the progress in bytes, the item being transferred, the number of waiting transfers, and a button that cancels the running transfer and the waiting ones. a cancelled file leaves nothing half written; what was already transferred stays
+- when the name is taken in the destination, `ConflictDialog` asks: keep both (numbered name, `photo (2).jpg`), replace, or skip, optionally for all the next conflicts of the transfer. going back skips. replacing a folder by a folder merges them, asking again for what conflicts inside
+- a copy to the folder the item is already in makes a numbered duplicate without asking; a move there does nothing; a folder cannot go inside itself
+- a moved folder is only removed from its source when everything in it went; with a skip inside, what was not transferred stays there
+- a copy keeps symbolic links as links and the permissions
 - the destination is expanded to show what arrived
-- while a transfer runs a progress bar without percentage is shown under the top bar. no cancellation, no conflict dialog, and no transfer between devices yet: these come with the transfer queue
+
+## settings
+
+- kept in `~/.config/sailtree/config.ini` (sections of `key=value` lines, private to the user), written at each change: show details, show hidden files, sort, and the current folder of the local device
+- a saved current folder that does not exist anymore falls back to the home folder
 
 ## local device
 
 - always present and connected from the start (no connection step), listed first, named after the hostname
-- its current folder is the home folder when the app starts; it is not remembered between runs yet
+- its current folder is the home folder the first time, then the one it had when the app was last used
 - creating a folder or file targets the selected item: inside a folder, in the current folder of a device, next to a file. a collapsed target is expanded to show the new item
 - rename refuses a name already taken instead of overwriting
 - deleting a folder deletes its content; deleting a symlink never touches its target
@@ -118,7 +128,7 @@ sailtree/
 │   ├── runtime.rs            tokio runtime, bridge to the Qt thread (queued_callback)
 │   ├── staging.rs            makes files visible to the sandboxed applications opening them
 │   ├── opener.rs             opens the files the system default cannot (empty files)
-│   ├── config.rs             recents, manual devices, settings (~/.config/sailtree)
+│   ├── config.rs             settings and devices remembered between runs (~/.config/sailtree/config.ini)
 │   ├── model/                QML-facing models
 │   │   ├── tree.rs           flattened QAbstractListModel
 │   │   ├── node.rs           node data
@@ -136,11 +146,11 @@ sailtree/
 │   │   ├── scan.rs           TCP sweep on ports 22/21
 │   │   └── resolve.rs        system reverse lookup
 │   └── transfer/
-│       ├── queue.rs          copy/move jobs across devices, progress, cancellation
-│       └── conflict.rs       overwrite / skip / rename
+│       ├── job.rs            one copy or move, inside a device or between two: progress, cancellation
+│       └── conflict.rs       overwrite / skip / keep both
 ├── qml/                      installed to /usr/share/sailtree/qml, not embedded
 │   ├── sailtree.qml          ApplicationWindow
-│   ├── pages/                full pages and dialogs (MainPage, AddDeviceDialog, LoginDialog, NameDialog, PermissionsDialog)
+│   ├── pages/                full pages and dialogs (MainPage, AddDeviceDialog, LoginDialog, NameDialog, PermissionsDialog, ConflictDialog)
 │   ├── components/           reusable items (TreeDelegate, SelectionCircle, SelectionActions, ActionButton)
 │   ├── icons/                action icons missing from the theme, svg
 │   ├── js/logic.js           interface logic without visual items (formatting, validation, permission bits)

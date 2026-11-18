@@ -8,14 +8,23 @@ Page {
     id: page
     allowedOrientations: Orientation.All
 
-    // second line with permissions, owner, size and date under each item
-    property bool showDetails: false
     // which drop-down of the top bar is open: "", "menu", "sort", or "add" for the single selected item
     property string openPanel: ""
 
     TreeModel {
         id: treeModel
         onFailed: Notices.show(message, Notice.Long, Notice.Bottom)
+        onConflict: {
+            // a page transition in progress would refuse the dialog, leaving the transfer waiting
+            pageStack.completeAnimation()
+            var dialog = pageStack.push(Qt.resolvedUrl("ConflictDialog.qml"), { name: name })
+            if (!dialog) {
+                treeModel.resolveConflict("skip", false)
+                return
+            }
+            dialog.accepted.connect(function() { treeModel.resolveConflict(dialog.answer, dialog.all) })
+            dialog.rejected.connect(function() { treeModel.resolveConflict("skip", false) })
+        }
         onOpenRequested: Qt.openUrlExternally(Logic.fileUrl(path))
         onRevealed: list.positionViewAtIndex(row, top ? ListView.Beginning : ListView.Contain)
         // each drop-down belongs to one state of the top bar
@@ -175,11 +184,25 @@ Page {
         }
 
         // a copy or move is running
-        ProgressBar {
+        Item {
             width: parent.width
+            height: progress.height
             visible: treeModel.busy
-            indeterminate: true
-            label: qsTr("Transferring…")
+
+            ProgressBar {
+                id: progress
+                anchors { left: parent.left; right: stopButton.left }
+                minimumValue: 0
+                maximumValue: 1
+                value: treeModel.transferProgress
+                label: Logic.transferLabel(treeModel.transferMoving, treeModel.transferName, treeModel.transferWaiting)
+            }
+            IconButton {
+                id: stopButton
+                anchors { right: parent.right; rightMargin: Theme.paddingMedium; verticalCenter: parent.verticalCenter }
+                icon.source: "image://theme/icon-m-clear"
+                onClicked: treeModel.cancelRunning()
+            }
         }
 
         // drop-down of the menu button
@@ -190,9 +213,9 @@ Page {
             TextSwitch {
                 text: qsTr("Show details")
                 description: qsTr("Permissions, owner, size and date")
-                checked: page.showDetails
+                checked: treeModel.showDetails
                 automaticCheck: false
-                onClicked: page.showDetails = !page.showDetails
+                onClicked: treeModel.showDetails = !treeModel.showDetails
             }
             TextSwitch {
                 text: qsTr("Show hidden files")
@@ -291,7 +314,7 @@ Page {
         delegate: TreeDelegate {
             width: list.width
             tree: treeModel
-            showDetails: page.showDetails
+            showDetails: treeModel.showDetails
             picking: treeModel.pendingCount > 0
             onPicked: treeModel.transferTo(model.index)
         }

@@ -67,7 +67,7 @@ ListItem {
                 case "device": return "image://theme/icon-m-phone"
                 case "folder": return "image://theme/icon-m-file-folder"
                 case "error": return "image://theme/icon-m-warning"
-                default: return "image://theme/icon-m-file-other-" + (Theme.colorScheme === Theme.LightOnDark ? "dark" : "light")
+                default: return Logic.fileIcon(model.name, Theme.colorScheme === Theme.LightOnDark)
                 }
             }
         }

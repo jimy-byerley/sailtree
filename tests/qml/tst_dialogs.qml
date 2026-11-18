@@ -12,6 +12,21 @@ TestCase {
     }
 
     Component {
+        id: conflictDialog
+        ConflictDialog { }
+    }
+
+    function test_conflictDialogSkipsByDefault() {
+        var dialog = conflictDialog.createObject(null, { name: "notes.txt" })
+        compare(dialog.answer, "skip")
+        compare(dialog.all, false)
+        verify(!dialog.canAccept)
+        dialog.all = true
+        compare(dialog.all, true)
+        dialog.destroy()
+    }
+
+    Component {
         id: permissionsDialog
         PermissionsDialog { }
     }

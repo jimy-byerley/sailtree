@@ -92,75 +92,89 @@ impl Local {
         .await
     }
 
-    pub async fn copy_into(&self, source: &Path, folder: &Path) -> Result<PathBuf> {
-        let (source, folder) = (source.to_owned(), folder.to_owned());
+    pub async fn rename_to(&self, from: &Path, to: &Path) -> Result<()> {
+        let (from, to) = (from.to_owned(), to.to_owned());
         blocking(move || {
-            let destination = arrival(&source, &folder)?;
-            copy_tree(&source, &destination)?;
-            Ok(destination)
+            fs::rename(&from, &to).map_err(|error| match error.raw_os_error() {
+                Some(libc::EXDEV) => FsError::CrossDevice,
+                _ => FsError::from_io(error, &from),
+            })
         })
         .await
     }
 
-    pub async fn move_into(&self, source: &Path, folder: &Path) -> Result<PathBuf> {
-        let (source, folder) = (source.to_owned(), folder.to_owned());
+    pub async fn symlink(&self, target: &Path, path: &Path) -> Result<()> {
+        let (target, path) = (target.to_owned(), path.to_owned());
         blocking(move || {
-            let destination = arrival(&source, &folder)?;
-            match fs::rename(&source, &destination) {
-                Ok(()) => {}
-                // another filesystem: the content has to travel
-                Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-                    copy_tree(&source, &destination)?;
-                    remove(&source)?;
-                }
-                Err(error) => return Err(FsError::from_io(error, &source)),
-            }
-            Ok(destination)
+            std::os::unix::fs::symlink(target, &path).map_err(|error| FsError::from_io(error, &path))
+        })
+        .await
+    }
+
+    pub async fn open(&self, path: &Path) -> Result<LocalFile> {
+        let path = path.to_owned();
+        blocking(move || {
+            let file = fs::File::open(&path).map_err(|error| FsError::from_io(error, &path))?;
+            Ok(LocalFile { file: Some(file), path })
+        })
+        .await
+    }
+
+    pub async fn create(&self, path: &Path, mode: u32) -> Result<LocalFile> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = path.to_owned();
+        blocking(move || {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&path)
+                .map_err(|error| FsError::from_io(error, &path))?;
+            Ok(LocalFile { file: Some(file), path })
         })
         .await
     }
 }
 
-/// where `source` arrives when copied or moved into `folder`, after checking it can
-fn arrival(source: &Path, folder: &Path) -> Result<PathBuf> {
-    let name = source
-        .file_name()
-        .ok_or_else(|| FsError::InvalidName(source.to_string_lossy().into_owned()))?;
-    fs::symlink_metadata(source).map_err(|error| FsError::from_io(error, source))?;
-    if folder.starts_with(source) {
-        return Err(FsError::Other(format!("{} cannot go inside itself", source.display())));
-    }
-    let destination = folder.join(name);
-    // nothing is replaced: this also refuses a copy or move to where the item already is
-    if fs::symlink_metadata(&destination).is_ok() {
-        return Err(FsError::AlreadyExists(destination));
-    }
-    Ok(destination)
+/// a file open for reading or writing by pieces
+#[derive(Debug)]
+pub struct LocalFile {
+    /// away while a blocking call works on it
+    file: Option<fs::File>,
+    path: PathBuf,
 }
 
-/// copy a file, a symbolic link (not its target), or a folder with its content
-fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source).map_err(|error| FsError::from_io(error, source))?;
-    let kind = metadata.file_type();
-    if kind.is_symlink() {
-        let target = fs::read_link(source).map_err(|error| FsError::from_io(error, source))?;
-        std::os::unix::fs::symlink(target, destination)
-            .map_err(|error| FsError::from_io(error, destination))
-    } else if kind.is_dir() {
-        fs::create_dir(destination).map_err(|error| FsError::from_io(error, destination))?;
-        for item in fs::read_dir(source).map_err(|error| FsError::from_io(error, source))? {
-            let item = item.map_err(|error| FsError::from_io(error, source))?;
-            copy_tree(&item.path(), &destination.join(item.file_name()))?;
-        }
-        // last, so the content of a read-only folder can be written
-        fs::set_permissions(destination, metadata.permissions())
-            .map_err(|error| FsError::from_io(error, destination))
-    } else if kind.is_file() {
-        fs::copy(source, destination)
-            .map(|_| ())
-            .map_err(|error| FsError::from_io(error, destination))
-    } else {
-        Err(FsError::Other(format!("{} is not a file, folder or link", source.display())))
+impl LocalFile {
+    fn take(&mut self) -> Result<(fs::File, PathBuf)> {
+        let file = self.file.take().ok_or_else(|| FsError::Other("file used after a failure".into()))?;
+        Ok((file, self.path.clone()))
+    }
+
+    /// the next bytes, at most `limit`, none at the end of the file
+    pub async fn read(&mut self, limit: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let (mut file, path) = self.take()?;
+        let (file, data) = blocking(move || {
+            let mut data = vec![0; limit];
+            let length = file.read(&mut data).map_err(|error| FsError::from_io(error, &path))?;
+            data.truncate(length);
+            Ok((file, data))
+        })
+        .await?;
+        self.file = Some(file);
+        Ok(data)
+    }
+
+    pub async fn write(&mut self, data: Vec<u8>) -> Result<()> {
+        use std::io::Write;
+        let (mut file, path) = self.take()?;
+        let file = blocking(move || {
+            file.write_all(&data).map_err(|error| FsError::from_io(error, &path))?;
+            Ok(file)
+        })
+        .await?;
+        self.file = Some(file);
+        Ok(())
     }
 }
 
@@ -587,99 +601,54 @@ mod tests {
         );
     }
 
-    /// temp/ { album/ { a.jpg, deep/ { b.jpg }, link -> a.jpg }, target/, note.txt }
-    fn transfer_sample() -> TempDir {
+    #[tokio::test]
+    async fn files_are_read_and_written_by_pieces() {
+        let dir = TempDir::new();
+        let source = dir.path().join("source");
+        fs::write(&source, b"0123456789").unwrap();
+        let mut reader = Local.open(&source).await.unwrap();
+        let mut writer = Local.create(&dir.path().join("copy"), 0o640).await.unwrap();
+        let mut pieces = Vec::new();
+        loop {
+            let data = reader.read(4).await.unwrap();
+            if data.is_empty() {
+                break;
+            }
+            pieces.push(data.len());
+            writer.write(data).await.unwrap();
+        }
+        drop(writer);
+        assert_eq!(pieces, [4, 4, 2]);
+        assert_eq!(fs::read(dir.path().join("copy")).unwrap(), b"0123456789");
+        let mode = fs::metadata(dir.path().join("copy")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+
+        // nothing is replaced, and missing files are reported
+        assert_eq!(
+            Local.create(&source, 0o644).await.err(),
+            Some(FsError::AlreadyExists(source.clone()))
+        );
+        let missing = dir.path().join("missing");
+        assert_eq!(Local.open(&missing).await.err(), Some(FsError::NotFound(missing)));
+    }
+
+    #[tokio::test]
+    async fn rename_to_another_folder_and_symlink() {
         let dir = TempDir::new();
         let root = dir.path();
-        fs::create_dir_all(root.join("album/deep")).unwrap();
         fs::create_dir(root.join("target")).unwrap();
-        fs::write(root.join("album/a.jpg"), b"aaaa").unwrap();
-        fs::write(root.join("album/deep/b.jpg"), b"bb").unwrap();
-        std::os::unix::fs::symlink("a.jpg", root.join("album/link")).unwrap();
-        fs::write(root.join("note.txt"), b"note").unwrap();
-        dir
-    }
-
-    #[tokio::test]
-    async fn copy_of_a_file_and_of_a_folder() {
-        let dir = transfer_sample();
-        let root = dir.path();
-        fs::set_permissions(root.join("note.txt"), fs::Permissions::from_mode(0o600)).unwrap();
-
-        let copy = local().copy_into(&root.join("note.txt"), &root.join("target")).await.unwrap();
-        assert_eq!(copy, root.join("target/note.txt"));
-        assert_eq!(fs::read(&copy).unwrap(), b"note");
-        assert_eq!(fs::metadata(&copy).unwrap().permissions().mode() & 0o777, 0o600);
-        assert!(root.join("note.txt").exists());
-
-        let copy = local().copy_into(&root.join("album"), &root.join("target")).await.unwrap();
-        assert_eq!(copy, root.join("target/album"));
-        assert_eq!(fs::read(copy.join("a.jpg")).unwrap(), b"aaaa");
-        assert_eq!(fs::read(copy.join("deep/b.jpg")).unwrap(), b"bb");
-        // links stay links
-        assert_eq!(fs::read_link(copy.join("link")).unwrap(), Path::new("a.jpg"));
-        assert!(root.join("album/deep/b.jpg").exists());
-    }
-
-    #[tokio::test]
-    async fn copy_of_a_read_only_folder() {
-        if is_root() {
-            return;
-        }
-        let dir = transfer_sample();
-        let root = dir.path();
-        fs::set_permissions(root.join("album/deep"), fs::Permissions::from_mode(0o555)).unwrap();
-        let copy = local().copy_into(&root.join("album"), &root.join("target")).await.unwrap();
-        assert!(copy.join("deep/b.jpg").exists());
-        assert_eq!(fs::metadata(copy.join("deep")).unwrap().permissions().mode() & 0o777, 0o555);
-        for path in [root.join("album/deep"), copy.join("deep")] {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn move_takes_the_item_away() {
-        let dir = transfer_sample();
-        let root = dir.path();
-        let moved = local().move_into(&root.join("album"), &root.join("target")).await.unwrap();
-        assert_eq!(moved, root.join("target/album"));
-        assert!(!root.join("album").exists());
-        assert_eq!(fs::read(moved.join("deep/b.jpg")).unwrap(), b"bb");
-
-        let moved = local().move_into(&root.join("note.txt"), &root.join("target/album")).await.unwrap();
-        assert_eq!(fs::read(moved).unwrap(), b"note");
-        assert!(!root.join("note.txt").exists());
-    }
-
-    #[tokio::test]
-    async fn transfers_never_replace_or_recurse() {
-        let dir = transfer_sample();
-        let root = dir.path();
-        fs::write(root.join("target/note.txt"), b"other").unwrap();
-        let taken = Err(FsError::AlreadyExists(root.join("target/note.txt")));
-        assert_eq!(local().copy_into(&root.join("note.txt"), &root.join("target")).await, taken);
-        assert_eq!(local().move_into(&root.join("note.txt"), &root.join("target")).await, taken);
-        assert_eq!(fs::read(root.join("target/note.txt")).unwrap(), b"other");
-        assert_eq!(fs::read(root.join("note.txt")).unwrap(), b"note");
-
-        // where it already is
+        fs::write(root.join("a"), b"a").unwrap();
+        local().rename_to(&root.join("a"), &root.join("target/b")).await.unwrap();
+        assert_eq!(fs::read(root.join("target/b")).unwrap(), b"a");
+        assert!(!root.join("a").exists());
         assert_eq!(
-            local().move_into(&root.join("note.txt"), root).await,
-            Err(FsError::AlreadyExists(root.join("note.txt")))
+            local().rename_to(&root.join("a"), &root.join("c")).await,
+            Err(FsError::NotFound(root.join("a")))
         );
-        // inside itself
-        for folder in [root.join("album"), root.join("album/deep")] {
-            assert!(matches!(local().copy_into(&root.join("album"), &folder).await, Err(FsError::Other(_))));
-            assert!(matches!(local().move_into(&root.join("album"), &folder).await, Err(FsError::Other(_))));
-        }
-        assert!(!root.join("album/album").exists());
-        assert!(!root.join("album/deep/album").exists());
 
-        assert_eq!(
-            local().copy_into(&root.join("missing"), &root.join("target")).await,
-            Err(FsError::NotFound(root.join("missing")))
-        );
-        assert!(local().copy_into(&root.join("note.txt"), &root.join("nowhere")).await.is_err());
+        local().symlink(Path::new("target/b"), &root.join("link")).await.unwrap();
+        assert_eq!(fs::read_link(root.join("link")).unwrap(), Path::new("target/b"));
+        assert!(local().symlink(Path::new("x"), &root.join("link")).await.is_err());
     }
 
     #[test]

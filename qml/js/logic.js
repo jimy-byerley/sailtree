@@ -85,6 +85,50 @@ function crumbs(path) {
     return result
 }
 
+// kinds of files the theme has an icon for, by extension
+var iconKinds = {
+    image: ["jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "svg", "heic"],
+    audio: ["mp3", "ogg", "oga", "flac", "wav", "m4a", "aac", "opus", "wma"],
+    video: ["mp4", "mkv", "avi", "mov", "webm", "m4v", "3gp", "mpg", "mpeg", "ogv"],
+    pdf: ["pdf"],
+    document: ["doc", "docx", "odt", "rtf"],
+    spreadsheet: ["xls", "xlsx", "ods", "csv"],
+    presentation: ["ppt", "pptx", "odp"],
+    formatted: ["html", "htm", "xml", "json", "md"],
+    note: ["txt", "log"],
+    compressed: ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar"],
+    apk: ["apk"],
+    rpm: ["rpm"],
+    vcard: ["vcf"]
+}
+// kinds whose icon exists in a variant for dark and for light backgrounds
+var schemedIcons = ["pdf", "document", "spreadsheet", "presentation", "formatted", "note", "other"]
+
+// kind of a file from its name, "other" when unknown
+function fileKind(name) {
+    var dot = name.lastIndexOf(".")
+    if (dot <= 0)
+        return "other"
+    var extension = name.slice(dot + 1).toLowerCase()
+    for (var kind in iconKinds)
+        if (iconKinds[kind].indexOf(extension) >= 0)
+            return kind
+    return "other"
+}
+
+// theme icon of a file. lightOnDark: the ambience has light text on a dark background
+function fileIcon(name, lightOnDark) {
+    var kind = fileKind(name)
+    var scheme = schemedIcons.indexOf(kind) >= 0 ? (lightOnDark ? "-dark" : "-light") : ""
+    return "image://theme/icon-m-file-" + kind + scheme
+}
+
+// what a running transfer shows: "Copying photo.jpg", with the number of waiting ones
+function transferLabel(moving, name, waiting) {
+    var text = (moving ? "Moving " : "Copying ") + name
+    return waiting > 0 ? text + " (+" + waiting + ")" : text
+}
+
 // capitalized category name for section headers
 function title(text) {
     return text.length > 0 ? text.charAt(0).toUpperCase() + text.slice(1) : text

@@ -1,6 +1,8 @@
 //! the list model shown by the main page: devices, with their folders and files below them
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
@@ -11,11 +13,14 @@ use qmetaobject::{
 
 use super::node::{Row, RowKind, Sort, Step, Tree};
 use super::selection::Selection;
-use crate::devices::{Device, DeviceId, DeviceKind};
+use crate::config::Config;
+use crate::devices::{Device, DeviceId, DeviceKind, LOCAL};
 use crate::fs::{mode_to_string, Entry, Fs, FsError};
 use crate::opener;
 use crate::runtime;
 use crate::staging;
+use crate::transfer::conflict::{Answer, Decision};
+use crate::transfer::job::{self, Event, Job, Outcome};
 
 /// data exposed for each row, in the order of their Qt role numbers
 const ROLES: [&str; 17] = [
@@ -65,8 +70,14 @@ struct State {
     selection: Selection,
     /// items waiting for the destination of their copy or move
     pending: Option<Pending>,
-    /// number of copies and moves being done
-    transfers: usize,
+    /// copies and moves waiting for the running one to end
+    queue: VecDeque<Transfer>,
+    running: Option<Running>,
+    /// answer to the conflicts of transfers run inline (unit tests), none to skip
+    inline_decision: Option<Decision>,
+    /// second line with the details of each item
+    show_details: bool,
+    config: Config,
     /// home folder of the user, where files are made visible to the applications opening them
     home: PathBuf,
     /// run filesystem operations before returning instead of in the background (unit tests)
@@ -75,7 +86,48 @@ struct State {
 
 impl Default for State {
     fn default() -> Self {
-        State::new(vec![Device::local()])
+        let config = Config::load(&crate::config::default_path());
+        let mut local = Device::local();
+        // back where the user was, if that still exists
+        if let Some(folder) = config.get(LOCAL_SECTION, "folder").map(PathBuf::from) {
+            if folder.is_absolute() && folder.is_dir() {
+                local.home = folder;
+            }
+        }
+        let mut state = State::new(vec![local]);
+        state.tree.set_show_hidden(config.flag(SETTINGS, "hidden").unwrap_or(false));
+        state.tree.set_sort(config.get(SETTINGS, "sort").and_then(parse_sort).unwrap_or_default());
+        state.show_details = config.flag(SETTINGS, "details").unwrap_or(false);
+        state.config = config;
+        state
+    }
+}
+
+/// configuration sections
+const SETTINGS: &str = "settings";
+const LOCAL_SECTION: &str = "local";
+
+fn parse_sort(name: &str) -> Option<Sort> {
+    match name {
+        "name" => Some(Sort::Name),
+        "date" => Some(Sort::Date),
+        "size" => Some(Sort::Size),
+        _ => None,
+    }
+}
+
+fn sort_name(sort: Sort) -> &'static str {
+    match sort {
+        Sort::Name => "name",
+        Sort::Date => "date",
+        Sort::Size => "size",
+    }
+}
+
+fn flag(value: bool) -> &'static str {
+    match value {
+        true => "true",
+        false => "false",
     }
 }
 
@@ -92,7 +144,11 @@ impl State {
             devices,
             selection: Selection::default(),
             pending: None,
-            transfers: 0,
+            queue: VecDeque::new(),
+            running: None,
+            inline_decision: None,
+            show_details: false,
+            config: Config::default(),
             home: Device::local().home,
             inline: false,
         }
@@ -124,6 +180,25 @@ impl State {
 struct Pending {
     moving: bool,
     items: Vec<(DeviceId, PathBuf)>,
+}
+
+/// a copy or move from one device into a folder of another, or of the same
+struct Transfer {
+    from: DeviceId,
+    to: DeviceId,
+    job: Job,
+}
+
+/// the transfer being done
+struct Running {
+    cancel: Arc<AtomicBool>,
+    /// where to answer the conflict the transfer is waiting on
+    reply: Option<tokio::sync::oneshot::Sender<Decision>>,
+    moving: bool,
+    done: u64,
+    total: u64,
+    /// item being transferred
+    name: String,
 }
 
 /// path standing for a device itself in the selection: its current folder changes
@@ -184,8 +259,24 @@ pub struct TreeModel {
     pendingMove: qt_property!(bool; READ pending_move NOTIFY pendingChanged),
     pendingChanged: qt_signal!(),
     /// whether a copy or move is being done
-    busy: qt_property!(bool; READ busy NOTIFY busyChanged),
-    busyChanged: qt_signal!(),
+    busy: qt_property!(bool; READ busy NOTIFY transferChanged),
+    /// part of the running transfer that is done, from 0 to 1
+    transferProgress: qt_property!(f64; READ transfer_progress NOTIFY transferChanged),
+    /// name of the item being transferred
+    transferName: qt_property!(QString; READ transfer_name NOTIFY transferChanged),
+    /// whether the running transfer is a move rather than a copy
+    transferMoving: qt_property!(bool; READ transfer_moving NOTIFY transferChanged),
+    /// number of transfers waiting for the running one
+    transferWaiting: qt_property!(i32; READ transfer_waiting NOTIFY transferChanged),
+    transferChanged: qt_signal!(),
+    /// the running transfer found an item of this name where it goes, and waits for
+    /// `resolveConflict`
+    conflict: qt_signal!(name: QString),
+
+    /// second line with permissions, owner, date and size under each item
+    #[allow(dead_code)] // storage unused, the value lives in the state
+    showDetails: qt_property!(bool; READ show_details WRITE set_show_details NOTIFY showDetailsChanged),
+    showDetailsChanged: qt_signal!(),
 
     /// an operation failed, with a message for the user
     failed: qt_signal!(message: QString),
@@ -224,6 +315,11 @@ pub struct TreeModel {
     /// copy or move the items kept aside into the folder at `row`, or into the current folder
     /// of the device at `row`
     transferTo: qt_method!(fn(&mut self, row: i32)),
+    /// answer the conflict the running transfer waits on with "overwrite", "skip" or "rename",
+    /// for this item or for `all` the next ones too
+    resolveConflict: qt_method!(fn(&mut self, answer: QString, all: bool)),
+    /// stop the running transfer and forget the waiting ones
+    cancelRunning: qt_method!(fn(&mut self)),
     /// select or unselect a device, file or folder
     toggleSelected: qt_method!(fn(&mut self, row: i32)),
     clearSelection: qt_method!(fn(&mut self)),
@@ -478,6 +574,9 @@ impl TreeModel {
     fn set_current(&mut self, device: DeviceId, path: PathBuf) {
         let steps = self.state.tree.plan_set_current(device, &path);
         self.run(steps);
+        if device == LOCAL {
+            self.state.config.set(LOCAL_SECTION, "folder", &path.to_string_lossy());
+        }
         // the previous rows are gone, the device itself may stay selected
         self.state.prune_selection();
         self.selectionChanged();
@@ -593,64 +692,120 @@ impl TreeModel {
 
     #[allow(non_snake_case)]
     fn transferTo(&mut self, row: i32) {
-        let Some((device, folder)) = self.destination(row) else { return };
+        let Some((to, folder)) = self.destination(row) else { return };
         let Some(Pending { moving, items }) = self.state.pending.take() else { return };
         self.pendingChanged();
-        if items.iter().any(|(source, _)| *source != device) {
-            self.report("transfers between devices are not supported yet");
+        // one job per device the items come from
+        let mut sources: BTreeMap<DeviceId, Vec<PathBuf>> = BTreeMap::new();
+        for (device, path) in items {
+            sources.entry(device).or_default().push(path);
+        }
+        for (from, sources) in sources {
+            let (Some(source), Some(destination)) = (self.fs(from), self.fs(to)) else { continue };
+            let job = Job {
+                moving,
+                from: source,
+                sources,
+                to: destination,
+                folder: folder.clone(),
+                same_device: from == to,
+            };
+            self.state.queue.push_back(Transfer { from, to, job });
+        }
+        self.transferChanged();
+        self.start_transfer();
+    }
+
+    /// run the next waiting transfer, if none is running
+    fn start_transfer(&mut self) {
+        if self.state.running.is_some() {
             return;
         }
-        let Some(fs) = self.fs(device) else { return };
-        let into = folder.clone();
-        self.state.transfers += 1;
-        self.busyChanged();
+        let Some(Transfer { from, to, job }) = self.state.queue.pop_front() else { return };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (moving, folder) = (job.moving, job.folder.clone());
+        self.state.running =
+            Some(Running { cancel: cancel.clone(), reply: None, moving, done: 0, total: 0, name: String::new() });
+        self.transferChanged();
+        let events: Box<dyn Fn(Event) + Send + Sync> = if self.state.inline {
+            let decision = self.state.inline_decision;
+            Box::new(move |event| {
+                if let (Event::Conflict { reply, .. }, Some(decision)) = (event, decision) {
+                    let _ = reply.send(decision);
+                }
+            })
+        } else {
+            let this = QPointer::from(&*self);
+            Box::new(qmetaobject::queued_callback(move |event: Event| {
+                if let Some(this) = this.as_pinned() {
+                    this.borrow_mut().transfer_event(event);
+                }
+            }))
+        };
         self.spawn(
-            async move {
-                let mut results = Vec::with_capacity(items.len());
-                for (_, source) in items {
-                    let result = async {
-                        let arrived = match moving {
-                            true => fs.move_into(&source, &into).await?,
-                            false => fs.copy_into(&source, &into).await?,
-                        };
-                        let entry = fs.stat(&arrived).await?;
-                        Ok::<_, FsError>((arrived, entry))
-                    }
-                    .await;
-                    results.push((source, result));
-                }
-                results
-            },
-            move |this, results| {
-                this.state.transfers -= 1;
-                this.busyChanged();
-                let count = results.len();
-                let mut errors = Vec::new();
-                let mut left = Vec::new();
-                for (source, result) in results {
-                    match result {
-                        Ok((arrived, entry)) => {
-                            if moving {
-                                let steps = this.state.tree.plan_remove(device, &source);
-                                this.run(steps);
-                                left.extend(source.parent().map(Path::to_owned));
-                            }
-                            this.upsert(device, &arrived, entry);
-                        }
-                        Err(error) => errors.push(error.to_string()),
-                    }
-                }
-                if errors.len() < count {
-                    this.arrived(device, &folder);
-                }
-                left.sort();
-                left.dedup();
-                for parent in left {
-                    this.measure(device, &parent);
-                }
-                this.report_all(&errors);
-            },
+            async move { job::run(job, &cancel, events).await },
+            move |this, outcome| this.transfer_done(from, to, &folder, outcome),
         );
+    }
+
+    /// news from the running transfer
+    fn transfer_event(&mut self, event: Event) {
+        let Some(running) = &mut self.state.running else { return };
+        match event {
+            Event::Progress { done, total, name } => {
+                (running.done, running.total, running.name) = (done, total, name);
+                self.transferChanged();
+            }
+            Event::Conflict { name, reply } => {
+                running.reply = Some(reply);
+                self.conflict(QString::from(name));
+            }
+        }
+    }
+
+    fn transfer_done(&mut self, from: DeviceId, to: DeviceId, folder: &Path, outcome: Outcome) {
+        self.state.running = None;
+        let mut left = Vec::new();
+        for source in outcome.left {
+            let steps = self.state.tree.plan_remove(from, &source);
+            self.run(steps);
+            left.extend(source.parent().map(Path::to_owned));
+        }
+        let arrived = !outcome.arrived.is_empty();
+        for (path, entry) in outcome.arrived {
+            self.upsert(to, &path, entry);
+        }
+        if arrived {
+            self.arrived(to, folder);
+        }
+        left.sort();
+        left.dedup();
+        for parent in left {
+            self.measure(from, &parent);
+        }
+        self.report_all(&outcome.errors);
+        self.transferChanged();
+        self.start_transfer();
+    }
+
+    #[allow(non_snake_case)]
+    fn resolveConflict(&mut self, answer: QString, all: bool) {
+        let reply = self.state.running.as_mut().and_then(|running| running.reply.take());
+        if let Some(reply) = reply {
+            let answer = Answer::parse(&answer.to_string()).unwrap_or(Answer::Skip);
+            let _ = reply.send(Decision { answer, all });
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn cancelRunning(&mut self) {
+        self.state.queue.clear();
+        if let Some(running) = &mut self.state.running {
+            running.cancel.store(true, Ordering::Relaxed);
+            // a transfer waiting on a conflict goes on, to see it is cancelled
+            running.reply = None;
+        }
+        self.transferChanged();
     }
 
     #[allow(non_snake_case)]
@@ -781,6 +936,7 @@ impl TreeModel {
         self.state.tree.set_show_hidden(show);
         let unselected = self.state.prune_selection();
         self.end_reset_model();
+        self.state.config.set(SETTINGS, "hidden", flag(show));
         self.showHiddenChanged();
         if unselected {
             self.selectionChanged();
@@ -792,26 +948,18 @@ impl TreeModel {
     }
 
     fn sort_name(&self) -> QString {
-        QString::from(match self.state.tree.sort() {
-            Sort::Name => "name",
-            Sort::Date => "date",
-            Sort::Size => "size",
-        })
+        QString::from(sort_name(self.state.tree.sort()))
     }
 
     fn set_sort_name(&mut self, name: QString) {
-        let sort = match name.to_string().as_str() {
-            "name" => Sort::Name,
-            "date" => Sort::Date,
-            "size" => Sort::Size,
-            _ => return,
-        };
+        let Some(sort) = parse_sort(&name.to_string()) else { return };
         if sort == self.state.tree.sort() {
             return;
         }
         self.begin_reset_model();
         self.state.tree.set_sort(sort);
         self.end_reset_model();
+        self.state.config.set(SETTINGS, "sort", sort_name(sort));
         self.sortChanged();
         // the selected row may have moved
         self.selectionChanged();
@@ -826,7 +974,38 @@ impl TreeModel {
     }
 
     fn busy(&self) -> bool {
-        self.state.transfers > 0
+        self.state.running.is_some()
+    }
+
+    fn transfer_progress(&self) -> f64 {
+        match &self.state.running {
+            Some(running) if running.total > 0 => (running.done as f64 / running.total as f64).min(1.0),
+            _ => 0.0,
+        }
+    }
+
+    fn transfer_name(&self) -> QString {
+        QString::from(self.state.running.as_ref().map_or("", |running| running.name.as_str()))
+    }
+
+    fn transfer_moving(&self) -> bool {
+        self.state.running.as_ref().is_some_and(|running| running.moving)
+    }
+
+    fn transfer_waiting(&self) -> i32 {
+        self.state.queue.len() as i32
+    }
+
+    fn show_details(&self) -> bool {
+        self.state.show_details
+    }
+
+    fn set_show_details(&mut self, show: bool) {
+        if show != self.state.show_details {
+            self.state.show_details = show;
+            self.state.config.set(SETTINGS, "details", flag(show));
+            self.showDetailsChanged();
+        }
     }
 
     fn selected_item_count(&self) -> i32 {
@@ -1524,12 +1703,81 @@ mod tests {
         model.toggleSelected(row_of(&model, "notes.txt"));
         model.startTransfer(true);
         model.transferTo(row_of(&model, "user"));
+        model.cancelRunning();
+        model.resolveConflict("overwrite".into(), true);
         model.toggleSelected(row_of(&model, "user"));
         model.startTransfer(false);
         model.transferTo(row_of(&model, "docs"));
         assert_eq!(names(&model), before);
         assert!(dir.path().join("home/user/notes.txt").exists());
         assert!(!dir.path().join("home/user/docs/user").exists());
+    }
+
+    #[test]
+    fn conflicts_follow_the_answer() {
+        let (dir, mut model) = sample();
+        let root = dir.path();
+        fs::write(root.join("etc/notes.txt"), b"old").unwrap();
+        open(&mut model);
+        // without answer the item is skipped
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.startTransfer(true);
+        model.transferTo(row_of(&model, "etc"));
+        assert_eq!(fs::read(root.join("etc/notes.txt")).unwrap(), b"old");
+        assert!(root.join("home/user/notes.txt").exists());
+
+        model.state.inline_decision = Some(Decision { answer: Answer::Rename, all: false });
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.startTransfer(false);
+        model.transferTo(row_of(&model, "etc"));
+        assert_eq!(fs::read(root.join("etc/notes (2).txt")).unwrap(), b"12345");
+
+        model.state.inline_decision = Some(Decision { answer: Answer::Overwrite, all: false });
+        // collapsed, so the only notes.txt shown is the one to move
+        model.toggle(row_of(&model, "etc"));
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.startTransfer(true);
+        model.transferTo(row_of(&model, "etc"));
+        assert_eq!(fs::read(root.join("etc/notes.txt")).unwrap(), b"12345");
+        assert!(!root.join("home/user/notes.txt").exists());
+        assert_eq!(names(&model)[1..5], ["  etc", "    hosts", "    notes (2).txt", "    notes.txt"]);
+        assert!(!model.busy());
+        assert_eq!(model.transfer_waiting(), 0);
+        assert_eq!(model.transfer_progress(), 0.0);
+    }
+
+    #[test]
+    fn copy_where_the_item_is_duplicates_it() {
+        let (dir, mut model) = sample();
+        open(&mut model);
+        model.toggleSelected(row_of(&model, "notes.txt"));
+        model.startTransfer(false);
+        model.transferTo(row_of(&model, "user"));
+        assert_eq!(fs::read(dir.path().join("home/user/notes (2).txt")).unwrap(), b"12345");
+        assert_eq!(names(&model)[4..], ["      docs", "      notes (2).txt", "      notes.txt"]);
+    }
+
+    #[test]
+    fn settings_are_remembered() {
+        let dir = TempDir::new();
+        let path = dir.path().join("config.ini");
+        let (_files, mut model) = sample();
+        model.state.config = Config::load(&path);
+        assert!(!model.show_details());
+        model.set_show_details(true);
+        model.set_show_details(true);
+        model.set_show_hidden(true);
+        model.set_sort_name("date".into());
+        model.toggle(0);
+        model.enter(row_of(&model, "etc"));
+
+        let config = Config::load(&path);
+        assert_eq!(config.flag(SETTINGS, "details"), Some(true));
+        assert_eq!(config.flag(SETTINGS, "hidden"), Some(true));
+        assert_eq!(config.get(SETTINGS, "sort"), Some("date"));
+        assert_eq!(config.get(LOCAL_SECTION, "folder"), Some(text(&model, 0, "path").as_str()));
+        assert_eq!(parse_sort("size"), Some(Sort::Size));
+        assert_eq!(parse_sort("colour"), None);
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub enum FsError {
     PermissionDenied(PathBuf),
     AlreadyExists(PathBuf),
     InvalidName(String),
+    /// a rename cannot take an item to another filesystem
+    CrossDevice,
     Other(String),
 }
 
@@ -56,6 +58,7 @@ impl fmt::Display for FsError {
             FsError::PermissionDenied(path) => write!(f, "permission denied on {}", path.display()),
             FsError::AlreadyExists(path) => write!(f, "{} already exists", path.display()),
             FsError::InvalidName(name) => write!(f, "\"{name}\" is not a valid name"),
+            FsError::CrossDevice => f.write_str("a rename cannot change filesystem"),
             FsError::Other(message) => f.write_str(message),
         }
     }
@@ -138,19 +141,32 @@ impl Fs {
         }
     }
 
-    /// copy an item, a folder with its content, into `folder`. returns the path of the copy.
-    /// fails if `folder` already has an item of this name
-    pub async fn copy_into(&self, source: &Path, folder: &Path) -> Result<PathBuf> {
+    /// rename an item to any path of the same filesystem. the caller checks that `to` is free.
+    /// fails with [FsError::CrossDevice] when `to` is on another filesystem
+    pub async fn rename_to(&self, from: &Path, to: &Path) -> Result<()> {
         match self {
-            Fs::Local(fs) => fs.copy_into(source, folder).await,
+            Fs::Local(fs) => fs.rename_to(from, to).await,
         }
     }
 
-    /// move an item into `folder`, returns its new path.
-    /// fails if `folder` already has an item of this name
-    pub async fn move_into(&self, source: &Path, folder: &Path) -> Result<PathBuf> {
+    /// create a symbolic link at `path`
+    pub async fn symlink(&self, target: &Path, path: &Path) -> Result<()> {
         match self {
-            Fs::Local(fs) => fs.move_into(source, folder).await,
+            Fs::Local(fs) => fs.symlink(target, path).await,
+        }
+    }
+
+    /// open a file to read it by pieces
+    pub async fn open(&self, path: &Path) -> Result<Reader> {
+        match self {
+            Fs::Local(fs) => Ok(Reader::Local(fs.open(path).await?)),
+        }
+    }
+
+    /// create a file to write it by pieces. fails if `path` exists
+    pub async fn create(&self, path: &Path, mode: u32) -> Result<Writer> {
+        match self {
+            Fs::Local(fs) => Ok(Writer::Local(fs.create(path, mode & 0o7777).await?)),
         }
     }
 
@@ -158,6 +174,45 @@ impl Fs {
     pub async fn chmod(&self, path: &Path, mode: u32) -> Result<()> {
         match self {
             Fs::Local(fs) => fs.chmod(path, mode & 0o7777).await,
+        }
+    }
+}
+
+/// size of the pieces files are transferred by
+pub const PIECE: usize = 256 * 1024;
+
+/// a file being read
+#[derive(Debug)]
+pub enum Reader {
+    Local(local::LocalFile),
+}
+
+impl Reader {
+    /// the next piece, empty at the end of the file
+    pub async fn read(&mut self) -> Result<Vec<u8>> {
+        match self {
+            Reader::Local(file) => file.read(PIECE).await,
+        }
+    }
+}
+
+/// a file being written
+#[derive(Debug)]
+pub enum Writer {
+    Local(local::LocalFile),
+}
+
+impl Writer {
+    pub async fn write(&mut self, data: Vec<u8>) -> Result<()> {
+        match self {
+            Writer::Local(file) => file.write(data).await,
+        }
+    }
+
+    /// everything was written
+    pub async fn finish(self) -> Result<()> {
+        match self {
+            Writer::Local(_) => Ok(()),
         }
     }
 }
