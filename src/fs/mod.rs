@@ -166,24 +166,6 @@ pub fn mode_to_string(mode: u32) -> String {
     text
 }
 
-/// inverse of [mode_to_string], `None` if the text is not 9 characters of `rwx-` in the right places
-pub fn mode_from_string(text: &str) -> Option<u32> {
-    if text.len() != 9 {
-        return None;
-    }
-    let mut mode = 0;
-    for (index, letter) in text.chars().enumerate() {
-        let expected = ['r', 'w', 'x'][index % 3];
-        mode <<= 1;
-        if letter == expected {
-            mode |= 1;
-        } else if letter != '-' {
-            return None;
-        }
-    }
-    Some(mode)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,19 +178,6 @@ mod tests {
         assert_eq!(mode_to_string(0o777), "rwxrwxrwx");
         // file type and special bits are ignored
         assert_eq!(mode_to_string(0o100644), "rw-r--r--");
-    }
-
-    #[test]
-    fn mode_string_parsing() {
-        assert_eq!(mode_from_string("rwxr-xr-x"), Some(0o755));
-        assert_eq!(mode_from_string("---------"), Some(0));
-        assert_eq!(mode_from_string("rw-r-----"), Some(0o640));
-        assert_eq!(mode_from_string("rwxrwxrw"), None);
-        assert_eq!(mode_from_string("wrxr-xr-x"), None);
-        assert_eq!(mode_from_string("rwxr-xr-xx"), None);
-        for mode in 0..0o1000 {
-            assert_eq!(mode_from_string(&mode_to_string(mode)), Some(mode));
-        }
     }
 
     #[test]

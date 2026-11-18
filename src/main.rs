@@ -1,5 +1,8 @@
-#[allow(dead_code)] // until the tree model uses it
+use std::ffi::CStr;
+
+mod devices;
 mod fs;
+mod model;
 mod runtime;
 mod sailfishapp;
 #[cfg(test)]
@@ -10,7 +13,10 @@ fn main() {
     runtime::runtime();
 
     let code = sailfishapp::run(|| {
-        // QML types get registered here
+        // usable from QML with `import Sailtree 1.0`
+        let module = CStr::from_bytes_with_nul(b"Sailtree\0").expect("valid C string");
+        let name = CStr::from_bytes_with_nul(b"TreeModel\0").expect("valid C string");
+        qmetaobject::qml_register_type::<model::tree::TreeModel>(module, 1, 0, name);
     });
     std::process::exit(code);
 }

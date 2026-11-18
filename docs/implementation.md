@@ -9,6 +9,23 @@
 - QML side is a single `SilicaListView` with `ListItem` delegates, indented by `depth` (capped visually), `section.property: "category"` for the connected/online/offline headers
 - a device changing category moves its whole row block (`begin_move_rows`)
 - selection is stored in rust as a set of `(device, path)`, never as row indices
+- more roles for the details: `selectable`, `path`, `size`, `date` (milliseconds), `owner`, `group`, `permissions` (`rwxr-xr-x`), `mode`, `link` (symlink target)
+- row changes are planned by Qt-free code (`model/node.rs`) as insert / remove / update steps, that the Qt model applies one by one between the matching begin/end notifications
+- only the visible rows are kept: collapsing a folder forgets what was expanded inside it
+- inside a folder: folders first, then names ignoring case
+- hidden items (leading dot) are filtered in rust; toggling them resets the model
+- a folder that cannot be listed shows an error row under it
+- symlinks are shown as what they point to (a link to a folder expands), broken links as files
+- what stops being displayed (collapsed folder, hidden items turned off, refreshed listing) is removed from the selection, so no action applies to something the user does not see
+- devices are not selectable yet: no action applies to the local device
+
+## local device
+
+- always present and connected from the start (no connection step), listed first, named after the hostname
+- its root is `/`; the first expansion expands the folders down to the home folder and scrolls to it, later expansions only show `/`
+- creating a folder or file targets the folder of the row it is asked from (the folder itself, or the folder of a file); from the top bar it targets the home folder. a collapsed target folder is expanded to show the new item
+- rename refuses a name already taken instead of overwriting
+- deleting a folder deletes its content; deleting a symlink never touches its target
 
 ## discovery
 
