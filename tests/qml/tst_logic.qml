@@ -190,4 +190,28 @@ TestCase {
         compare(Logic.title("connected"), "Connected")
         compare(Logic.title(""), "")
     }
+
+    function test_pathMarkup() {
+        compare(Logic.pathMarkup("/home/user/Documents", "#f00", 0), '/home/user/<font color="#f00">Documents</font>')
+        compare(Logic.pathMarkup("/home/user/", "#f00", 0), '/home/<font color="#f00">user</font>')
+        compare(Logic.pathMarkup("/etc", "#f00", 0), '/<font color="#f00">etc</font>')
+        compare(Logic.pathMarkup("/", "#f00", 0), '<font color="#f00">/</font>')
+        compare(Logic.pathMarkup("/a<b/c&d", "#f00", 0), '/a&lt;b/<font color="#f00">c&amp;d</font>')
+        // first levels left out
+        compare(Logic.pathMarkup("/home/user/Documents", "#f00", 1), '\u2026/user/<font color="#f00">Documents</font>')
+        compare(Logic.pathMarkup("/home/user/Documents", "#f00", 2), '\u2026/<font color="#f00">Documents</font>')
+        compare(Logic.pathMarkup("/home/user/Documents", "#f00", 9), '\u2026/<font color="#f00">Documents</font>')
+        compare(Logic.pathMarkup("/", "#f00", 3), '<font color="#f00">/</font>')
+    }
+
+    function test_coverLines() {
+        compare(Logic.coverLines([], 0, 5), [])
+        compare(Logic.coverLines(["a", "b"], 2, 5), ["a", "b"])
+        compare(Logic.coverLines(["a", "b", "c"], 3, 3), ["a", "b", "c"])
+        compare(Logic.coverLines(["a", "b", "c", "d"], 4, 3), ["a", "b", "+ 2 more"])
+        // the folder has more items than the names given
+        compare(Logic.coverLines(["a", "b"], 50, 5), ["a", "b", "+ 48 more"])
+        compare(Logic.coverLines(["a", "b", "c"], 50, 3), ["a", "b", "+ 48 more"])
+        compare(Logic.coverLines(["a"], 1, 0), [])
+    }
 }

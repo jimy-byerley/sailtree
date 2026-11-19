@@ -149,3 +149,28 @@ function validPort(port) {
 function title(text) {
     return text.length > 0 ? text.charAt(0).toUpperCase() + text.slice(1) : text
 }
+
+// path of a folder as styled text for the cover, its last level in the `accent` color.
+// the first `skipped` levels under the root are replaced by an ellipsis, for paths taking too much room
+function pathMarkup(path, accent, skipped) {
+    function escaped(text) {
+        return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    }
+    var parts = path.split("/").filter(function(part) { return part.length > 0 })
+    var last = parts.length > 0 ? parts.pop() : "/"
+    var skip = Math.max(0, Math.min(skipped, parts.length))
+    var before = (skip > 0 ? "\u2026/" : parts.length > 0 || last !== "/" ? "/" : "")
+        + parts.slice(skip).map(function(part) { return part + "/" }).join("")
+    return escaped(before) + '<font color="' + accent + '">' + escaped(last) + "</font>"
+}
+
+// the lines of the cover: the first of `names`, the last line telling how many of the
+// `total` items of the folder are left out when there is no room for all
+function coverLines(names, total, room) {
+    if (room <= 0)
+        return []
+    if (total <= room && names.length >= total)
+        return names.slice(0, total)
+    var shown = Math.min(names.length, room - 1)
+    return names.slice(0, shown).concat("+ " + (total - shown) + " more")
+}

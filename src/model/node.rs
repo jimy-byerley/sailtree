@@ -140,6 +140,22 @@ pub fn order(sort: Sort, a: &Entry, b: &Entry) -> Ordering {
         .then_with(|| a.name.cmp(&b.name))
 }
 
+/// what the cover shows of a folder: its first names in display order, folders ending with a `/`,
+/// and how many items it has in all
+pub fn summary(mut entries: Vec<Entry>, sort: Sort, show_hidden: bool, limit: usize) -> (Vec<String>, usize) {
+    entries.retain(|entry| show_hidden || !entry.hidden());
+    entries.sort_by(|a, b| order(sort, a, b));
+    let names = entries
+        .iter()
+        .take(limit)
+        .map(|entry| match entry.kind {
+            Kind::Folder => format!("{}/", entry.name),
+            _ => entry.name.clone(),
+        })
+        .collect();
+    (names, entries.len())
+}
+
 /// a run of sibling rows, each followed by its descendants, with every level put in order
 fn reordered(rows: &[Row], sort: Sort) -> Vec<Row> {
     let Some(first) = rows.first() else { return Vec::new() };
@@ -486,6 +502,15 @@ mod tests {
             group: "user".into(),
             mode: 0o644,
         }
+    }
+
+    #[test]
+    fn summary_of_a_folder() {
+        let entries = vec![file("b.txt"), file(".hidden"), folder("docs"), file("a.txt")];
+        assert_eq!(summary(entries.clone(), Sort::Name, false, 10), (vec!["docs/".to_owned(), "a.txt".into(), "b.txt".into()], 3));
+        assert_eq!(summary(entries.clone(), Sort::Name, false, 2), (vec!["docs/".to_owned(), "a.txt".into()], 3));
+        assert_eq!(summary(entries, Sort::Name, true, 1), (vec!["docs/".to_owned()], 4));
+        assert_eq!(summary(Vec::new(), Sort::Name, true, 5), (Vec::new(), 0));
     }
 
     fn file(name: &str) -> Entry {

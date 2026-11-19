@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 
 use qmetaobject::{
     qt_base_class, qt_method, qt_property, qt_signal, QAbstractListModel, QByteArray, QModelIndex,
-    QObject, QPointer, QString, QVariant, USER_ROLE,
+    QObject, QPointer, QString, QVariant, QVariantList, USER_ROLE,
 };
 
-use super::node::{Row, RowKind, Sort, Step, Tree};
+use super::node::{self, Row, RowKind, Sort, Step, Tree};
 use super::selection::Selection;
 use crate::config::Config;
 use crate::devices::{self, Device, DeviceId, DeviceKind, Remote, State as DeviceState, LOCAL};
@@ -88,6 +88,8 @@ struct State {
     inline_decision: Option<Decision>,
     /// second line with the details of each item
     show_details: bool,
+    /// content of the local current folder, for the cover
+    cover: Cover,
     config: Config,
     /// home folder of the user, where files are made visible to the applications opening them
     home: PathBuf,
@@ -115,6 +117,18 @@ impl Default for State {
         state
     }
 }
+
+/// what the cover shows: the first items of a folder of the local device
+#[derive(Default)]
+struct Cover {
+    folder: PathBuf,
+    names: Vec<String>,
+    /// number of items in the folder, listed or not
+    count: usize,
+}
+
+/// names kept for the cover: more than it has room for
+const COVER_ITEMS: usize = 20;
 
 /// configuration sections
 const SETTINGS: &str = "settings";
@@ -164,6 +178,7 @@ impl State {
             running: None,
             inline_decision: None,
             show_details: false,
+            cover: Cover::default(),
             config: Config::default(),
             home: Device::local().home,
             inline: false,
@@ -381,6 +396,17 @@ pub struct TreeModel {
     probe: qt_method!(fn(&mut self)),
     /// look for devices of the local network that are not listed yet
     discover: qt_method!(fn(&mut self)),
+    /// current folder of the local device, and its first items (folders end with a `/`) once
+    /// `refreshCover` has listed them
+    coverFolder: qt_property!(QString; READ cover_folder NOTIFY coverFolderChanged),
+    coverFolderChanged: qt_signal!(),
+    coverItems: qt_property!(QVariantList; READ cover_items NOTIFY coverChanged),
+    /// number of items in that folder, `coverItems` being its first ones only
+    coverCount: qt_property!(i32; READ cover_count NOTIFY coverChanged),
+    coverChanged: qt_signal!(),
+    /// list the current folder of the local device again for the cover
+    refreshCover: qt_method!(fn(&mut self)),
+
     /// select or unselect a device, file or folder
     toggleSelected: qt_method!(fn(&mut self, row: i32)),
     clearSelection: qt_method!(fn(&mut self)),
@@ -1053,6 +1079,9 @@ impl TreeModel {
         self.run(steps);
         if device == LOCAL {
             self.state.config.set(LOCAL_SECTION, "folder", &path.to_string_lossy());
+            // the list kept for the cover is of another folder
+            self.coverFolderChanged();
+            self.coverChanged();
         } else if let Some(index) = self.state.devices.iter().position(|other| other.id == device) {
             self.state.devices[index].home = path.clone();
             self.state.devices[index].save(&mut self.state.config);
@@ -1498,6 +1527,49 @@ impl TreeModel {
         }
     }
 
+    fn local_folder(&self) -> Option<&Path> {
+        let row = self.state.tree.find_device(LOCAL)?;
+        self.state.tree.row(row).map(|row| row.path.as_path())
+    }
+
+    /// the listing kept for the cover, unless the current folder changed since
+    fn cover(&self) -> Option<&Cover> {
+        Some(&self.state.cover).filter(|cover| Some(cover.folder.as_path()) == self.local_folder())
+    }
+
+    fn cover_folder(&self) -> QString {
+        QString::from(self.local_folder().map_or(String::new(), |path| path.to_string_lossy().into_owned()))
+    }
+
+    fn cover_items(&self) -> QVariantList {
+        let mut items = QVariantList::default();
+        for name in self.cover().map_or(&[][..], |cover| &cover.names) {
+            items.push(QString::from(name.as_str()).into());
+        }
+        items
+    }
+
+    fn cover_count(&self) -> i32 {
+        self.cover().map_or(0, |cover| cover.count as i32)
+    }
+
+    #[allow(non_snake_case)]
+    fn refreshCover(&mut self) {
+        let Some(folder) = self.local_folder().map(Path::to_owned) else { return };
+        let Some(fs) = self.fs(LOCAL) else { return };
+        let listed = folder.clone();
+        self.spawn(
+            // a folder that cannot be listed shows as empty
+            async move { fs.list(&listed).await.unwrap_or_default() },
+            move |this, entries| {
+                let tree = &this.state.tree;
+                let (names, count) = node::summary(entries, tree.sort(), tree.show_hidden(), COVER_ITEMS);
+                this.state.cover = Cover { folder, names, count };
+                this.coverChanged();
+            },
+        );
+    }
+
     fn selected_item_count(&self) -> i32 {
         self.state.selection.iter().filter(|(_, path)| path != device_item()).count() as i32
     }
@@ -1629,6 +1701,29 @@ mod tests {
         assert_eq!(roles.len(), ROLES.len());
         assert_eq!(roles[&USER_ROLE].to_string(), "name");
         assert_eq!(roles[&(USER_ROLE + 6)].to_string(), "selected");
+    }
+
+    #[test]
+    fn cover_lists_the_local_current_folder() {
+        let (dir, mut model) = sample();
+        let root = dir.path().to_owned();
+        assert_eq!(model.cover_folder().to_string(), root.to_str().unwrap());
+        assert_eq!(model.cover_count(), 0);
+        // listed without the device being expanded
+        model.refreshCover();
+        assert_eq!(model.cover().unwrap().names, ["etc/", "home/"]);
+        assert_eq!(model.cover_count(), 2);
+
+        // another current folder: the previous list is not shown for it
+        model.set_current(0, root.join("home/user"));
+        assert_eq!(model.cover_folder().to_string(), root.join("home/user").to_str().unwrap());
+        assert_eq!(model.cover_count(), 0);
+        model.refreshCover();
+        assert_eq!(model.cover().unwrap().names, ["docs/", "notes.txt"]);
+        model.set_show_hidden(true);
+        model.refreshCover();
+        assert_eq!(model.cover().unwrap().names, [".config/", "docs/", "notes.txt"]);
+        assert_eq!(model.cover_count(), 3);
     }
 
     #[test]

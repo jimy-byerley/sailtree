@@ -171,13 +171,16 @@ sailtree/
 │   ├── js/logic.js           interface logic without visual items (formatting, validation, permission bits)
 │   └── cover/                CoverPage
 ├── tests/qml/                QML unit tests (QtTest), rust unit tests stay next to the code
-├── icons/<size>/sailtree.png sizes 86x86, 108x108, 128x128, 172x172
+├── icons/sailtree.svg        launcher icon, the reference drawing
+├── icons/<size>/sailtree.png sizes 86x86, 108x108, 128x128, 172x172, drawn by scripts/make-icons.py
 ├── sailtree.desktop          with [X-Sailjail] Sandboxing=Disabled
 ├── rpm/sailtree.spec         offline cargo build and install
 ├── translations/             optional .ts files
 └── docs/
 ```
 
+- the launcher icon follows the Sailfish app icon guide: its fully rounded base shape (a circle), drawn on 86 px with no padding but a 0.3 px gap, a greyscale gradient as background and a simple white picture inside, here a small tree of items
+- the cover shows the full path of the current folder of the local device, its last level in the accent color as in the tree (over three lines at most: first levels are replaced by an ellipsis until it fits), and its first items in the display order of the tree (same sort and hidden files setting, folders ending with a `/`), as many as fit, the last line telling how many are left out, and a refresh button at the bottom. the model lists that folder on its own (`refreshCover`, at most 20 names kept) when the cover appears, when the current folder changes, when a transfer ends and on the button, so it does not depend on the device being expanded in the tree. the cover gets the model of the main page through the application window
 - `vendor/` is generated at packaging time (`cargo vendor`), not committed
 - startup goes through a C++ shim calling `SailfishApp::application()` / `createView()` / `pathToMainQml()`
 

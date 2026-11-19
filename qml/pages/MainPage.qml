@@ -10,6 +10,8 @@ Page {
 
     // which drop-down of the top bar is open: "", "menu", "sort", or "add" for the single selected item
     property string openPanel: ""
+    // for the cover
+    property alias model: treeModel
 
     TreeModel {
         id: treeModel
