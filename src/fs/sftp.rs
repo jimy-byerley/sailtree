@@ -16,6 +16,9 @@ use super::{Entry, FsError, Kind, Result};
 /// how long a connection attempt or a silent server is waited for
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+/// how long the goodbye to a server is waited for when a session is closed
+const CLOSING: Duration = Duration::from_secs(2);
+
 /// sftp status codes
 const NO_SUCH_FILE: i32 = 2;
 const PERMISSION_DENIED: i32 = 3;
@@ -38,6 +41,14 @@ struct Inner {
     /// kept for as long as the sftp channel is used
     _session: Session,
     home: PathBuf,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // closing tells the server, and waits for its answer: not for long, it may be gone.
+        // this still blocks, sessions are to be dropped out of the Qt thread
+        self._session.set_timeout(CLOSING.as_millis() as u32);
+    }
 }
 
 impl std::fmt::Debug for Sftp {
@@ -228,6 +239,16 @@ impl Sftp {
         tokio::task::spawn_blocking(move || operation(&inner))
             .await
             .unwrap_or_else(|failure| Err(FsError::Other(format!("sftp task failed: {failure}"))))
+    }
+
+    /// whether the server still answers. an answer that is a refusal counts
+    pub async fn alive(&self) -> bool {
+        self.run(|inner| match inner.sftp.realpath(Path::new(".")) {
+            Err(failure) if matches!(failure.code(), ErrorCode::Session(_)) => Err(FsError::Other(failure.message().to_owned())),
+            _ => Ok(()),
+        })
+        .await
+        .is_ok()
     }
 
     pub async fn list(&self, path: &Path) -> Result<Vec<Entry>> {

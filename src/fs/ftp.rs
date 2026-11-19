@@ -420,6 +420,11 @@ impl Ftp {
         .unwrap_or_else(|failure| Err(FsError::Other(format!("ftp task failed: {failure}"))))
     }
 
+    /// whether the server still answers
+    pub async fn alive(&self) -> bool {
+        self.run(|control| control.command("NOOP").map(|_| ()).map_err(broken)).await.is_ok()
+    }
+
     pub async fn list(&self, path: &Path) -> Result<Vec<Entry>> {
         let path = path.to_owned();
         self.run(move |control| control.list(&path)).await

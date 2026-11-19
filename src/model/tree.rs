@@ -77,6 +77,8 @@ struct State {
     pending: Option<Pending>,
     /// remote devices a connection is being opened to
     connecting: HashSet<DeviceId>,
+    /// connected remote devices whose connection is being checked
+    checking: HashSet<DeviceId>,
     /// a look at the network is running
     discovering: bool,
     /// what the network shows, instead of looking at it (unit tests)
@@ -172,6 +174,7 @@ impl State {
             selection: Selection::default(),
             pending: None,
             connecting: HashSet::new(),
+            checking: HashSet::new(),
             discovering: false,
             inline_found: None,
             queue: VecDeque::new(),
@@ -853,7 +856,7 @@ impl TreeModel {
         device.remembered = true;
         device.save(&mut self.state.config);
         // what was open spoke the other protocol
-        self.close(id);
+        self.close(id, DeviceState::Online);
         self.device_changed(id);
     }
 
@@ -890,7 +893,7 @@ impl TreeModel {
         let steps = self.state.tree.plan_name_device(id, &name);
         self.run(steps);
         if connected && reconnect {
-            self.close(id);
+            self.close(id, DeviceState::Online);
         } else if connected && entered {
             self.set_current(id, folder);
         } else if entered {
@@ -913,7 +916,10 @@ impl TreeModel {
         };
         let steps = self.state.tree.plan_remove_device(id);
         self.run(steps);
-        let device = self.state.devices.remove(index);
+        let mut device = self.state.devices.remove(index);
+        if let Some(fs) = device.fs.take() {
+            self.release(fs);
+        }
         device.forget(&mut self.state.config);
         self.state.connecting.remove(&id);
         self.state.prune_selection();
@@ -986,19 +992,41 @@ impl TreeModel {
 
     fn disconnect(&mut self, row: i32) {
         if let Some(id) = self.remote_at(row).map(|device| device.id) {
-            self.close(id);
+            // it was answering a moment ago
+            self.close(id, DeviceState::Online);
         }
     }
 
-    /// close the connection of a remote device: it stays listed, collapsed
-    fn close(&mut self, id: DeviceId) {
+    /// let go of a session. closing it tells the device and waits for its answer, which takes
+    /// seconds when it is not there anymore: not on the Qt thread
+    fn release(&self, fs: Fs) {
+        if self.state.inline {
+            drop(fs);
+        } else {
+            runtime::runtime().spawn_blocking(move || drop(fs));
+        }
+    }
+
+    /// the connection of a device does not answer anymore
+    fn lost(&mut self, id: DeviceId, state: DeviceState) {
+        let Some(name) = self.state.device(id).filter(|device| device.fs.is_some()).map(|device| device.name.clone())
+        else {
+            return;
+        };
+        self.close(id, state);
+        self.report(format!("connection to {name} lost"));
+    }
+
+    /// close the connection of a remote device: it stays listed, collapsed, in the category of `state`
+    fn close(&mut self, id: DeviceId, state: DeviceState) {
         let Some(device) = self.state.devices.iter_mut().find(|device| device.id == id) else { return };
-        if device.remote.is_none() || device.fs.take().is_none() {
+        if device.remote.is_none() {
             return;
         }
-        // it was answering a moment ago
-        device.state = DeviceState::Online;
+        let Some(fs) = device.fs.take() else { return };
+        device.state = state;
         let folder = device.home.clone();
+        self.release(fs);
         let steps = self.state.tree.plan_set_current(id, &folder);
         self.run(steps);
         self.state.prune_selection();
@@ -1007,6 +1035,7 @@ impl TreeModel {
     }
 
     fn probe(&mut self) {
+        self.check_connections();
         let waiting: Vec<(DeviceId, String, u16)> = self
             .state
             .devices
@@ -1023,6 +1052,43 @@ impl TreeModel {
                     if device.fs.is_none() && device.state != state {
                         device.state = state;
                         this.place(id);
+                    }
+                },
+            );
+        }
+    }
+
+    /// check that the connected remote devices still answer: a connection cut on the way
+    /// (network left, device turned off) is not told by the system before long
+    fn check_connections(&mut self) {
+        let connected: Vec<(DeviceId, Fs, String, u16)> = self
+            .state
+            .devices
+            .iter()
+            .filter(|device| !self.state.checking.contains(&device.id))
+            .filter_map(|device| {
+                let remote = device.remote.as_ref()?;
+                Some((device.id, device.fs.clone()?, remote.host.clone(), remote.port))
+            })
+            .collect();
+        for (id, fs, host, port) in connected {
+            self.state.checking.insert(id);
+            self.spawn(
+                // the category the device goes to when its connection is lost
+                async move {
+                    let reachable = tokio::task::spawn_blocking(move || devices::reachable(&host, port)).await.unwrap_or(false);
+                    if !reachable {
+                        Some(DeviceState::Offline)
+                    } else if fs.alive().await {
+                        None
+                    } else {
+                        Some(DeviceState::Online)
+                    }
+                },
+                move |this, lost| {
+                    this.state.checking.remove(&id);
+                    if let Some(state) = lost {
+                        this.lost(id, state);
                     }
                 },
             );
@@ -2499,6 +2565,35 @@ mod tests {
         assert_eq!(model.deviceRow(1), 2);
         assert_eq!(model.deviceIdAt(99), -1);
         assert_eq!(model.deviceRow(99), -1);
+    }
+
+    #[test]
+    fn probing_notices_lost_connections() {
+        let (_files, mut model) = sample();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        model.addDevice("kept".into(), "127.0.0.1".into(), port, "me".into(), "".into(), false);
+        model.addDevice("gone".into(), "127.0.0.1".into(), 1, "me".into(), "".into(), false);
+        // both connected, the local filesystem standing for their session
+        for id in [1, 2] {
+            let device = model.state.device_mut(id).unwrap();
+            device.fs = Some(Fs::Local(Local));
+            device.state = DeviceState::Connected;
+            model.place(id);
+        }
+        assert_eq!(device_names(&model), ["phone [connected]", "kept [connected]", "gone [connected]"]);
+        model.toggle(model.deviceRow(2));
+        assert!(model.row_count() > 3);
+
+        model.probe();
+        // nothing answers at the address of the second one: closed and collapsed
+        assert_eq!(device_names(&model), ["phone [connected]", "kept [connected]", "gone [offline]"]);
+        assert_eq!(model.row_count(), 3);
+        assert!(model.state.device(2).unwrap().fs.is_none());
+        assert!(model.state.checking.is_empty());
+        // disconnecting by hand leaves the device online
+        model.disconnect(model.deviceRow(1));
+        assert_eq!(device_names(&model), ["phone [connected]", "kept [online]", "gone [offline]"]);
     }
 
     #[test]

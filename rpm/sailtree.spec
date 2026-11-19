@@ -1,6 +1,6 @@
 Name:       sailtree
 Summary:    Local and remote file explorer
-Version:    0.1.0
+Version:    0.1.1
 Release:    1
 License:    LicenseRef-TBD
 URL:        https://github.com/jimy-byerley/sailtree
@@ -44,6 +44,7 @@ File explorer for the local device and remote devices (sftp, ftp).
     export CARGO_HOME=$PWD/target/cargo-home; \
     export CARGO_TARGET_DIR=$PWD/target; \
     export QMAKE=%{_bindir}/qmake; \
+    export PKG_CONFIG_ALLOW_CROSS=1; \
     export SB2_RUST_EXECVP_SHIM="/usr/bin/env LD_PRELOAD=/usr/lib/libsb2/libsb2.so.1 /usr/bin/env"; \
     export SB2_RUST_USE_REAL_EXECVP=Yes SB2_RUST_USE_REAL_FN=Yes SB2_RUST_NO_SPAWNVP=Yes; \
     case "$(stat -f -c %%T .)" in \
@@ -54,6 +55,8 @@ File explorer for the local device and remote devices (sftp, ftp).
 # QMAKE is explicit because probing for a missing qmake6 fails with a bogus error under scratchbox.
 # rustc needs mmap for its build products, which the shared folders of the SDK's VirtualBox
 # build engine (fuse) do not support: there the target dir goes to the engine's own disk.
+# PKG_CONFIG_ALLOW_CROSS: for arm targets rust runs as an i686 host building for another architecture,
+# which the pkg-config crate refuses by default; scratchbox's pkg-config already answers for the target.
 # the SB2_RUST_* settings and the single job avoid cargo hanging between fork and exec under scratchbox.
 %cargo_env
 cargo build --release --locked -j1

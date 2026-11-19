@@ -28,6 +28,13 @@ CoverBackground {
         onBusyChanged: cover.refresh()
     }
 
+    // the picture of the launcher icon behind the text, made and shown as on the covers of the
+    // system's apps: an image of the size of the cover, with its own transparency
+    Image {
+        anchors.fill: parent
+        source: "../icons/cover.png"
+    }
+
     Label {
         id: lineHeight
         visible: false

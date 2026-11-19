@@ -16,12 +16,15 @@ esac
 #   because rustc needs mmap, which the engine's shared folders do not support
 # - the SB2_RUST_* settings and the single job avoid cargo hanging between fork and exec under scratchbox
 # - QMAKE is given explicitly because probing for a missing qmake6 fails with a bogus error under scratchbox
+# - PKG_CONFIG_ALLOW_CROSS: on arm targets rust is an i686 host building for another architecture, which the
+#   pkg-config crate refuses by default; the pkg-config of scratchbox already answers for the target
 exec "$SFDK" -c target="$TARGET" build-shell bash -c '
     export SB2_RUST_TARGET_TRIPLE='$TRIPLE' CARGO_BUILD_TARGET='$TRIPLE'
     export CARGO_HOME=$PWD/target/cargo-home
     export CARGO_TARGET_DIR=$HOME/cargo-target/sailtree
     export CARGO_PROFILE_DEV_DEBUG=0
     export QMAKE=/usr/bin/qmake
+    export PKG_CONFIG_ALLOW_CROSS=1
     export SB2_RUST_EXECVP_SHIM="/usr/bin/env LD_PRELOAD=/usr/lib/libsb2/libsb2.so.1 /usr/bin/env"
     export SB2_RUST_USE_REAL_EXECVP=Yes SB2_RUST_USE_REAL_FN=Yes SB2_RUST_NO_SPAWNVP=Yes
     export CARGO_BUILD_JOBS=1

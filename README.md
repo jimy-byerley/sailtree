@@ -43,7 +43,7 @@ sfdk -c target=SailfishOS-5.1.0.11-i486 build
 
 The package lands in `RPMS/sailtree-<version>.i486.rpm`. A release build from scratch takes a few minutes.
 
-Only the `i486` target (the SDK emulator) is built and tested so far. Building for a phone means using an `aarch64` or `armv7hl` target instead; this has not been tried yet.
+For a phone, use the target of its architecture, for instance `SailfishOS-5.1.0.11-aarch64` for a Jolla C2. The `aarch64` package builds, but only the `i486` one (the SDK emulator) has been run and tested so far; `armv7hl` has not been tried.
 
 ### Install
 
@@ -100,7 +100,7 @@ Logic is kept out of the Qt types where possible, so it can be unit tested witho
 
 ### Launcher icon
 
-`icons/sailtree.svg` is the reference drawing, on one of the base shapes of the [Sailfish app icon guide](https://sailfishos.org/design/icons/). The png files of each size are drawn from the same description by `python3 scripts/make-icons.py` (needs Pillow); change both together.
+`icons/sailtree.svg` is the reference drawing, on one of the base shapes of the [Sailfish app icon guide](https://sailfishos.org/design/icons/). The png files of each size are drawn from the same description by `python3 scripts/make-icons.py` (needs Pillow); change both together. The same script draws the picture shown behind the cover, `qml/icons/cover.png`.
 
 ### Tests
 
@@ -156,4 +156,4 @@ Both are for tests only: weak passwords, and the FTP server gives write access t
 
 Working: the local device, SFTP and FTP devices, discovery, transfers between devices.
 
-Not done yet: key based ssh login, FTP over TLS, resuming interrupted transfers, builds for phone architectures, packaging for the Chum repository, and the choice of a license (the rpm spec has a placeholder).
+Not done yet: key based ssh login, FTP over TLS, resuming interrupted transfers, tests on a real phone, packaging for the Chum repository, and the choice of a license (the rpm spec has a placeholder).

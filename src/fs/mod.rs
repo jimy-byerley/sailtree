@@ -101,6 +101,15 @@ impl Fs {
         }
     }
 
+    /// whether the connection to the device still answers
+    pub async fn alive(&self) -> bool {
+        match self {
+            Fs::Local(_) => true,
+            Fs::Sftp(fs) => fs.alive().await,
+            Fs::Ftp(fs) => fs.alive().await,
+        }
+    }
+
     /// content of a folder, in no particular order
     pub async fn list(&self, path: &Path) -> Result<Vec<Entry>> {
         match self {
